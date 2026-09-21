@@ -2,259 +2,135 @@
 
 Personal Linux server administration and deployment scripts.
 
-Planned components:
+- `caddy/` — Caddy installation, migration, upgrade, validation and rollback.
+- `sing-box/` and `web/` — planned components.
 
-- `caddy/` — Caddy installation, upgrade, validation, and rollback scripts.
-- `sing-box/` — sing-box Stable installation, upgrade, and configuration checks.
-- `web/` — Web/PHP environment setup helpers.
+## Caddy manager — Debian 12/13
 
-## Design principles
+`caddy/manage-caddy.sh` uses the official Stable APT repository, vendor service
+and `dpkg-divert`/`update-alternatives` layout:
 
-- Prefer official APT repositories and official systemd services.
-- Keep modifications to upstream service/configuration files to a minimum.
-- Keep service users separated (`caddy`, `sing-box`, `www-data`) from the administrative login user (`ubuntu`).
-- Use `/var/www/<site>` for website repositories, normally owned by `ubuntu:ubuntu`.
-- Grant PHP-FPM write access only to application directories that require it.
-- Let Caddy manage TLS certificates; sing-box reads certificates directly from Caddy storage.
+- `/usr/bin/caddy.default`: official APT binary.
+- `/usr/bin/caddy.custom`: custom binary, selected at `/usr/bin/caddy`.
+- Custom modules: `github.com/mholt/caddy-l4`,
+  `github.com/WeidiDeng/caddy-cloudflare-ip`, `github.com/caddyserver/jsonc-adapter`.
+- Configuration: `/etc/caddy/caddy.jsonc`, always with `--adapter jsonc`.
 
-## Caddy manager (Debian 12/13)
+Caddy and sing-box share the existing **sing-box:sing-box** account. Caddy keeps
+its official service; `/etc/systemd/system/caddy.service.d/override.conf` sets
+`User=sing-box`, `Group=sing-box` and JSONC `ExecStart`/`ExecReload`. It also fixes
+`HOME=/var/lib/caddy` so switching accounts does not relocate Caddy's default
+storage or autosaved configuration to sing-box's home. This is a fixed service
+setting, not a new script option. Do not override Caddy's HOME/XDG paths elsewhere.
 
-`caddy/manage-caddy.sh` keeps the official Stable APT package and its service/user
-layout. The official executable is diverted to `/usr/bin/caddy.default`; the
-custom executable is `/usr/bin/caddy.custom`, selected explicitly through
-`update-alternatives` at `/usr/bin/caddy`. The only added modules are:
+Caddy storage remains `/var/lib/caddy/.local/share/caddy`. The manager assigns
+`/var/lib/caddy` and its contents to `sing-box:sing-box`, including parent
+directories required for access. `/etc/caddy` becomes `root:sing-box` mode 0750;
+`caddy.jsonc` becomes `root:sing-box` mode 0640. The APT-created caddy account is
+left installed, but is no longer the runtime account.
 
-- `github.com/mholt/caddy-l4`
-- `github.com/WeidiDeng/caddy-cloudflare-ip`
-- `github.com/caddyserver/jsonc-adapter`
+The official sing-box service and `/etc/sing-box` are never edited or restarted.
+There are no ACLs, certificate scanners, cron jobs, copy-to-sing-box tasks or
+certificate synchronization helpers. Both processes have the same filesystem
+identity; they can read the same private keys, including newly created files.
 
-The configuration is always `/etc/caddy/caddy.jsonc` with adapter `jsonc`.
-The manager writes only an `ExecStart`/`ExecReload` drop-in, never a replacement
-for the vendor service. See the [official custom binary procedure](https://caddyserver.com/docs/build#package-support-files-for-custom-builds-for-debianubunturaspbian)
-and [Stable APT repository instructions](https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
-It never runs experimental `caddy upgrade`.
+## Usage
 
-### Prerequisites and commands
-
-Run as root on a systemd host. Have `iproute2` (`ss`), `util-linux` (`flock`,
-`runuser`), coreutils, dpkg and APT available. Install `python3` before install/migrate; the read-only ACL audit also requires
-the `acl` package (`getfacl`) and the `sing-box` user. Upgrade also needs `curl`, a current
-Go toolchain and `xcaddy` already installed in root's PATH; the script does not
-silently install a compiler. All commands work without an interactive terminal. Keep the companion
-`caddy/certificate-check.py` beside `manage-caddy.sh` when copying the scripts.
-
-Prepare your JSONC before installing. Provide a binary with the three modules
-for installation; migration reuses the selected managed custom binary when present, otherwise
-defaulting to `/usr/local/bin/caddy`. Examples:
+Run as root with systemd, coreutils, dpkg/APT, `iproute2` (`ss`) and `util-linux`
+(`flock`, `runuser`). Install sing-box's official user/group first; the manager
+checks their existence without changing accounts or the sing-box service.
+Upgrade also needs `curl`, a current Go toolchain and `xcaddy` in root's PATH.
+No Python or ACL tools are required; commands work without an interactive terminal.
 
 ```bash
-# Fresh install: choose ports actually required by YOUR configuration.
+# Prepare /etc/caddy/caddy.jsonc and a binary with the three modules first.
+# Set ports to match YOUR configuration.
 sudo env CADDY_CUSTOM_BINARY=/path/to/custom-caddy \
   CADDY_REQUIRED_PORTS="tcp:80 tcp:443" bash caddy/manage-caddy.sh install
 
-# Legacy www-data unit, /usr/local/bin/caddy, /home/tls:
+# Migrate a legacy www-data unit, or switch an existing caddy:caddy deployment.
 sudo bash caddy/manage-caddy.sh migrate
-
-# Build the latest upstream Stable release using xcaddy:
 sudo bash caddy/manage-caddy.sh upgrade
-
 sudo bash caddy/manage-caddy.sh check
 sudo bash caddy/manage-caddy.sh status
 
-# Read-only dependency/permission audits; no lock, backup, APT or systemd calls:
-sudo bash caddy/manage-caddy.sh check-cert-paths
-sudo bash caddy/manage-caddy.sh check-cert-access
-
-# Latest committed snapshot, or a particular snapshot printed by the manager:
+# Latest committed snapshot, or an explicit snapshot directory:
 sudo bash caddy/manage-caddy.sh rollback
 sudo bash caddy/manage-caddy.sh rollback /var/backups/caddy-manager/TIMESTAMP.SUFFIX
 ```
 
-`CADDY_REQUIRED_PORTS` is a space-separated list such as `tcp:443 udp:443`.
-The manager automatically preserves all TCP/UDP listening ports owned by the
-running Caddy MainPID, including the admin port. Explicit ports augment that
-baseline. For an inactive/fresh installation, explicit ports are required.
-Port checks verify ownership by the new Caddy process, not just an unrelated
-process listening on the same port. They do not replace application-level HTTP,
-TLS, DNS or upstream connectivity checks.
+Migration uses the selected custom binary if present, otherwise
+`/usr/local/bin/caddy`; `CADDY_CUSTOM_BINARY` can supply a different binary.
+An existing caddy-user deployment must run `migrate` before `upgrade`.
+`CADDY_REQUIRED_PORTS` augments the running MainPID's TCP/UDP listeners, e.g.
+`tcp:443 udp:443`. Explicit ports are required for an inactive/fresh installation.
+Checks verify active state, MainPID, executable and port ownership; they do not
+replace application-level HTTP/TLS/upstream tests.
 
-### Upgrade and transaction recovery
+## Migration and certificate paths
 
-Upgrade fetches GitHub's latest non-prerelease Caddy release, builds that exact
-version with the three modules, verifies the reported version and exact module
-IDs, and validates the current JSONC with the new binary as both root and caddy
-before touching the installed binary. Module dependencies resolve at build time;
-this is not a reproducible build with pinned plugin revisions.
+Migration copies `/home/tls` once into the standard storage, without overwriting
+newer destination files on repeated runs. Literal JSONC roots `/home/tls` and
+`/home/tls/` are rewritten to `/var/lib/caddy/.local/share/caddy`. Use that explicit
+file-system root or Caddy's default storage; other custom storage paths are outside
+this migration's scope. `/home/tls` remains old data for manual review and rollback;
+it is not renewed after migration and is not a long-term certificate source.
 
-The transaction is: preflight → private backup → change → validate → restart →
-active/MainPID/executable/port checks → commit. Binary replacement uses a temporary
-file in `/usr/bin` and a same-filesystem rename. Download/build failures fail
-closed; a timeout bounds validation and building (`CADDY_BUILD_TIMEOUT`, default
-1800 seconds). Health checks retry for approximately 15 seconds. A lock prevents
-concurrent manager operations; avoid running other package/service management
-commands during a transaction.
-
-Snapshots under `/var/backups/caddy-manager` contain binaries, `/etc/caddy`, local
-and runtime units/drop-ins, the usual multi-user enablement link, both storage
-trees, alternatives selection/priorities/mode, diversion state and service
-active/enabled metadata. They also contain private diagnostic unit metadata:
-**treat backups as secrets**. The directory is root-only; status and validation
-never print JSONC, certificate contents or journal messages.
-
-On any error or handled INT/TERM/HUP after the transaction starts, the manager
-restores the selected snapshot, validates the old configuration and starts/checks
-the old executable if it was previously active. A previously inactive service
-stays inactive. A failed recovery returns an error and retains its backup for
-manual recovery. SIGKILL, kernel crashes and power loss cannot run a shell trap;
-keep the printed snapshot path for explicit recovery. Manual rollback first
-creates a rescue snapshot of the current environment. Old v1 snapshots without
-transaction metadata are rejected.
-
-Rollback removes only manager-supported alternatives/diversion changes. It
-**does not uninstall the official Caddy package** or remove the newly configured
-Stable APT repository: if the package was newly installed, its binary remains
-available while the old local service and binary resume serving traffic.
-
-Successful transactions retain five committed snapshots by default; change with
-`CADDY_BACKUP_KEEP=10`. Incomplete, failed and restored snapshots are retained for
-manual review. Rollback without an argument chooses the latest still-committed
-snapshot; explicit paths also allow recovery from failed transactions.
-
-### Migration details and limits
-
-Migration stops the writer after the initial backup, refreshes the storage
-snapshot, prevents APT maintainer scripts from auto-starting services with a
-short-lived `policy-rc.d`, installs the official package, and removes legacy
-local units/drop-ins after backing them up. It restores any pre-existing
-`policy-rc.d` on exit. The effective target service must run as `caddy:caddy`.
-Existing third-party legacy overrides are intentionally not carried into the new
-service; review any environment files, bind mounts, capabilities or custom
-sandbox requirements beforehand.
-
-`/home/tls` is copied into `/var/lib/caddy/.local/share/caddy` without overwriting
-existing destination files. Literal JSONC storage roots `/home/tls` and
-`/home/tls/` are rewritten. Other references are rejected for manual adjustment.
-The JSONC becomes `root:caddy` mode 0640; storage belongs to `caddy:caddy`.
-Rollback overlays saved storage contents and ownership, preserving files created
-since the snapshot. It never deletes `/home/tls`, even after a successful migration.
-Repeated migration therefore cannot replace newer target certificates with stale
-legacy ones. `/home/tls` is retained only as old data/rollback material. Caddy
-will not renew it after switching storage; retaining it is not a certificate
-sharing or synchronization solution. No sing-box files or services are changed.
-
-Validation runs without importing arbitrary systemd environment directives. A
-configuration that needs those variables or additional filesystem permissions
-may fail validation safely; resolve that before restarting. Masked/transient
-service states, foreign diversion owners, unusual enablement/alias links, alternatives slave links and foreign
-binary candidates are rejected instead of guessed. Health checks cover the main
-Caddy process; special multi-process wrappers are unsupported.
-
-### sing-box certificate paths and the ACL migration gate
-
-Before **any** Caddy validation, backup, stop, package action or storage change,
-install/migrate scans `/etc/sing-box` when present. `check-cert-paths` exposes the
-same read-only scan. It lists only filenames (escaped to prevent terminal control
-characters), never matching lines, certificate/key contents, passwords or UUIDs.
-It scans all regular files recursively, including extensionless fragments,
-comments/backups and linked configurations. JSON escaped slashes/Unicode paths
-are recognized. Unreadable files, broken/cyclic links, special files or files
-over 16 MiB cause an incomplete-check error and block the operation. Configuration
-outside this tree, environment-expanded paths or arbitrary path aliases need
-manual review; this is not a complete sing-box configuration validator.
-
-If any file references `/home/tls`, migration stops **before the transaction**.
-Manually plan changes to sing-box's `certificate_path` and `key_path` so they read
-the actual certificate and key directly under:
+After verifying Caddy, **manually** update sing-box's `certificate_path` and
+`key_path` to the actual issuer/domain files under:
 
 ```text
 /var/lib/caddy/.local/share/caddy/certificates/<issuer>/<domain>/<domain>.crt
 /var/lib/caddy/.local/share/caddy/certificates/<issuer>/<domain>/<domain>.key
 ```
 
-Use the actual issuer/domain layout on the host. The manager never edits sing-box
-configuration, changes its official unit, reloads/restarts sing-box, or creates a
-cron/copy/synchronization job. Coordinate any manual activation separately, and
-retain the old sing-box configuration for a coordinated manual rollback.
+This script neither scans nor blocks old sing-box paths. Coordinate the sing-box
+configuration change and any activation yourself. Keep its previous configuration
+for a coordinated manual rollback; the manager rolls back Caddy only.
 
-**Default ACLs alone are not a renewal-safe solution.** The inspected upstream
-[CertMagic FileStorage](https://github.com/caddyserver/certmagic/blob/master/filestorage.go)
-creates directories with `0700` and atomically stores files with `0600`.
-[Linux ACL inheritance](https://man7.org/linux/man-pages/man5/acl.5.html) restricts
-the inherited ACL mask to the creation mode. A named sing-box entry can remain
-present but have no effective permission after a new directory/file or atomic
-replacement. Changing umask or setting a default ACL does not override this.
-The existing-file ACL may work today and still fail at renewal.
+## Transactions and recovery
 
-Consequently, **install/migrate also blocks detected references to the new Caddy
-storage**, even when all current ACL checks pass. Changing the paths alone does
-not unlock migration. A durable certificate-writer permission design must be
-resolved separately before enabling this shared-storage transition. There is no
-unsafe bypass flag. Caddy without a detected sing-box storage dependency can
-still migrate. This conservative gate preserves the constraints on standard
-storage, official units and the three custom modules instead of silently adding
-a privileged reader or another storage/synchronization mechanism.
+The flow remains **preflight → backup → change → validate → restart → health
+check → commit**. Upgrade builds the latest Stable release with xcaddy and checks
+its version, modules and JSONC before replacing the installed custom binary using
+a same-directory temporary file and atomic rename. It never runs `caddy upgrade`.
+Validation of the target runs as sing-box with Caddy's fixed HOME.
 
-For an operator-reviewed setup, the intended narrow ACL scope is:
+Root-only snapshots in `/var/backups/caddy-manager` preserve binaries, `/etc/caddy`,
+local/runtime units and drop-ins, storage files with ownership/modes, alternatives,
+diversion and active/enabled state. Migration stops Caddy and refreshes storage
+before changing ownership. A temporary `policy-rc.d` blocks package auto-starts
+and is restored on exit. Legacy Caddy units/drop-ins are backed up and replaced
+by the official unit plus the small drop-in.
 
-- Only traverse (`--x`) for sing-box on `/var/lib/caddy`, `.local`, `.local/share`
-  and `.local/share/caddy`; no recursive read grant or default ACL on these parents.
-- Read/traverse (`r-x`) on `certificates` and its directories, read-only (`r--`)
-  on existing certificate/key files, and default read/traverse ACLs on directories
-  **inside that subtree only**. No access to sibling ACME accounts or other storage.
-- No reliance on sing-box's `CAP_DAC_READ_SEARCH`. Do not modify its official unit.
+On failure or handled INT/TERM/HUP, rollback restores the old unit (including its
+user/group), JSONC, binaries and package-selection state. Saved storage ownership
+and permissions are restored; retained new files take the old storage directory's
+owner. `/home/tls` is not deleted. The old binary/config is validated as its former
+user before starting and checking a previously active service; an inactive service
+stays inactive. Rollback does not require the new sing-box account. It never
+uninstalls the official Caddy package. An explicit rollback first takes a rescue
+snapshot of the current Caddy environment.
 
-The following documents the **current-file/default ACL baseline**, not a fix for
-future `0600` replacements and not a command that unlocks the migration gate.
-Run only after the directories exist and after reviewing existing ACLs/masks:
-`setfacl` recalculates the mask and can reactivate previously masked entries.
-These commands are documentation; manage-caddy does not run them.
+Keep backups private: they contain configuration, keys and service metadata.
+By default, five committed snapshots are kept (`CADDY_BACKUP_KEEP` changes this).
+Failed/restored snapshots are retained. Build timeout is 1800 seconds
+(`CADDY_BUILD_TIMEOUT`); health checks retry for about 15 seconds. A lock prevents
+concurrent manager runs. Avoid concurrent package/service changes. SIGKILL or
+power loss cannot run a shell trap; use the printed backup path for recovery.
+A failed recovery reports an error and retains its snapshot for manual repair.
 
-```bash
-sudo apt-get install acl
-sudo setfacl -m u:sing-box:--x \
-  /var/lib/caddy \
-  /var/lib/caddy/.local \
-  /var/lib/caddy/.local/share \
-  /var/lib/caddy/.local/share/caddy
-
-certs=/var/lib/caddy/.local/share/caddy/certificates
-sudo test -d "$certs" || exit 1
-sudo find "$certs" -type d -exec setfacl -m u:sing-box:r-x,d:u:sing-box:r-x -- {} +
-sudo find "$certs" -type f -exec setfacl -m u:sing-box:r-- -- {} +
-sudo bash caddy/manage-caddy.sh check-cert-access
-```
-
-`check-cert-access` reads numeric ACL entries/masks for those exact parents and
-the certificates subtree. It rejects missing, masked or excessive named grants,
-missing default entries, and storage symlinks. It never opens certificate files in Caddy storage or changes ACLs. A present default ACL is explicitly **not** reported as proof of
-future access. Return codes: `check-cert-paths` returns 0 when no old reference is
-found, 1 for old references, 2 for incomplete scans. `check-cert-access` currently
-returns 1 even with correct current ACLs because renewal access is unproven, or 2
-when it cannot finish the audit. Its output distinguishes those cases.
-
-No ACL mutation occurs during preflight or migration. An early path/ACL audit
-failure therefore cannot leave partial permissions or a half-migrated service.
-Rollback deliberately does **not** call the sing-box path/ACL gate: recovery of the
-old Caddy remains possible even when the new dependency audit would fail.
-
-### Local verification
+## Verification
 
 ```bash
 bash -n caddy/manage-caddy.sh
 bash -n caddy/tests/transactions.sh
 shellcheck caddy/manage-caddy.sh caddy/tests/transactions.sh
 bash caddy/tests/transactions.sh
-python3 -B caddy/tests/certificates.py
 ```
 
-The test harness redirects production paths into a `mktemp` directory and uses
-command doubles for systemd/divert/alternatives; it does not operate a real
-service or package database. It exercises legacy/custom rollback, storage
-preservation, inactive-state restoration, automatic error recovery and recovery
-failure reporting, upgrade build/validation/replacement/restart/health failures,
-pre-transaction certificate gate failures and read-only command dispatch. The
-Python suite tests escaped paths, scan errors, secret-safe output, ACL masks/defaults,
-narrow inspection scope and rejection of a false renewal guarantee. Windows Git Bash can run the suite, but does not establish
-Debian ownership, symlink, APT or systemd integration correctness. Before production
-use, verify fresh install, migration, failed restart and rollback in disposable
-Debian 12 and 13 systemd VMs with representative non-secret configurations.
+Tests use temporary paths and systemd/APT/ownership doubles. They cover legacy
+and custom rollback, inactive state, upgrade failures, shared-user setup,
+repeated/no-legacy storage setup and migration failures. Windows Git Bash can
+run them, but cannot verify actual Linux ownership, APT or systemd integration.
+Test those in disposable Debian 12/13 VMs before production use.

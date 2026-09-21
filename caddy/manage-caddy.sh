@@ -12,8 +12,6 @@ readonly -a SNAPSHOT_PATHS=(usr/local/bin/caddy usr/bin/caddy.custom etc/caddy
   run/systemd/system/caddy.service run/systemd/system/caddy.service.d
   etc/systemd/system/multi-user.target.wants/caddy.service
   home/tls var/lib/caddy)
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly SCRIPT_DIR
 WORK='' BACKUP='' TRANSACTION=0 POLICY=0 ATOMIC=''
 log(){ printf '[INFO] %s\n' "$*"; }
 warn(){ printf '[WARN] %s\n' "$*" >&2; }
@@ -58,7 +56,7 @@ finish(){
 init(){
   require_root; check_os
   local tool
-  for tool in flock systemctl dpkg-divert update-alternatives ss tar runuser timeout; do
+  for tool in flock systemctl dpkg-divert update-alternatives ss runuser timeout; do
     command -v "$tool" >/dev/null || die "Missing prerequisite: $tool"
   done
   install -d -m 0700 "$BACKUP_ROOT"
@@ -80,7 +78,9 @@ check_modules(){
 validate_config(){
   local bin=${1:-$CADDY_BIN} user=${2:-root}
   [[ -f $CONFIG ]] || die "Missing $CONFIG"
-  quiet timeout 120 runuser -u "$user" -- "$bin" validate --config "$CONFIG" --adapter jsonc || die "JSONC validation failed as $user."
+  local -a runtime_env=()
+  [[ $user != sing-box ]] || runtime_env=(env HOME=/var/lib/caddy)
+  quiet timeout 120 runuser -u "$user" -- "${runtime_env[@]}" "$bin" validate --config "$CONFIG" --adapter jsonc || die "JSONC validation failed as $user."
 }
 check_layout(){
   local divert
@@ -131,6 +131,9 @@ health(){
   return 1
 }
 preflight(){
+  if ! getent passwd sing-box >/dev/null || ! getent group sing-box >/dev/null; then
+    die 'Install the official sing-box user/group first.'
+  fi
   check_layout
   [[ -f $CONFIG ]] || die "Place JSONC at $CONFIG first."
   local state pid exe token link
@@ -223,6 +226,8 @@ restore_backup(){
     case $p in home/tls|var/lib/caddy)
       if exists "$d/files/$p"; then
         mkdir -p "/$p"
+        # Retained new files must also be usable by the old storage owner.
+        chown -R --reference="$d/files/$p" "/$p"
         cp -a "$d/files/$p/." "/$p/"
       fi ;;
     *)
@@ -300,6 +305,8 @@ install_custom_binary(){
   update-alternatives --set caddy "$CUSTOM_BIN"
 }
 check_service_contract(){
+  [[ $(systemctl show -p User --value caddy.service) == sing-box && $(systemctl show -p Group --value caddy.service) == sing-box ]] || die 'Run migrate to switch Caddy to sing-box:sing-box.'
+  [[ " $(systemctl show -p Environment --value caddy.service) " == *" HOME=/var/lib/caddy "* ]] || die 'Caddy HOME must be /var/lib/caddy; run migrate.'
   local start reload
   start=$(systemctl show -p ExecStart --value caddy.service)
   reload=$(systemctl show -p ExecReload --value caddy.service)
@@ -310,6 +317,9 @@ install_dropin(){
   install -d -m 0755 "$(dirname "$DROPIN")"
   cat >"$DROPIN" <<'UNIT'
 [Service]
+User=sing-box
+Group=sing-box
+Environment=HOME=/var/lib/caddy
 ExecStart=
 ExecStart=/usr/bin/caddy run --config /etc/caddy/caddy.jsonc --adapter jsonc
 ExecReload=
@@ -317,20 +327,20 @@ ExecReload=/usr/bin/caddy reload --config /etc/caddy/caddy.jsonc --adapter jsonc
 UNIT
   chmod 0644 "$DROPIN"
   systemctl daemon-reload
-  [[ $(systemctl show -p User --value caddy.service) == caddy ]] || die 'Effective service user must be caddy.'
-  [[ $(systemctl show -p Group --value caddy.service) == caddy ]] || die 'Effective service group must be caddy.'
   check_service_contract
 }
 migrate_tls(){
+  install -d -m 0700 "$CADDY_DATA"
   if [[ -d $LEGACY_DATA ]]; then
-    install -d -o caddy -g caddy -m 0700 "$CADDY_DATA"
     # Never overwrite an already-populated destination with stale legacy storage.
     cp -an "$LEGACY_DATA/." "$CADDY_DATA/"
-    chown -R caddy:caddy "$CADDY_DATA"
     sed -i "s#\"/home/tls/\{0,1\}\"#\"$CADDY_DATA\"#g" "$CONFIG"
   fi
   if grep -q '/home/tls' "$CONFIG"; then die 'Unresolved legacy storage reference; use a literal /home/tls storage root.'; fi
-  chown root:caddy "$CONFIG"
+  # Include HOME and intermediate directories, even when /home/tls is absent.
+  chown -R sing-box:sing-box /var/lib/caddy
+  chown root:sing-box /etc/caddy "$CONFIG"
+  chmod 0750 /etc/caddy
   chmod 0640 "$CONFIG"
 }
 build_custom(){
@@ -351,7 +361,6 @@ build_custom(){
   [[ ${actual%% *} == "$version" ]] || die 'Built version differs from requested Stable release.'
   log "Built $version"
   check_modules "$WORK/caddy"
-  validate_config "$WORK/caddy"
 }
 commit_transaction(){
   printf 'committed\n' >"$BACKUP/result"
@@ -372,34 +381,23 @@ upgrade_cmd(){
   preflight
   [[ -x $CUSTOM_BIN && $(readlink -f "$CADDY_BIN") == "$CUSTOM_BIN" ]] || die 'Run install/migrate to establish the managed layout first.'
   [[ ! -f /etc/systemd/system/caddy.service && ! -f /run/systemd/system/caddy.service ]] || die 'Run migrate to restore the official unit first.'
-  [[ $(systemctl show -p User --value caddy.service) == caddy ]] || die 'Run migrate first.'
-  [[ $(systemctl show -p Group --value caddy.service) == caddy ]] || die 'Effective group must be caddy.'
   [[ -f $DROPIN ]] || die 'Managed JSONC drop-in missing; run install/migrate.'
   [[ $(dpkg-divert --truename "$CADDY_BIN") == "$DEFAULT_BIN" && -s $WORK/alternatives ]] || die 'Managed diversion/alternatives missing.'
   check_service_contract
   build_custom
-  # Permit traversal for caddy validation; all other temporary files remain private.
+  # Permit traversal for sing-box validation; all other temporary files remain private.
   chmod 0711 "$WORK"
   chmod 0755 "$WORK/caddy"
-  validate_config "$WORK/caddy" caddy
+  validate_config "$WORK/caddy" sing-box
   backup_current
   TRANSACTION=1
   atomic_binary "$WORK/caddy" "$CUSTOM_BIN"
-  validate_config "$CUSTOM_BIN" caddy
   systemctl restart caddy.service
   health "$WORK/ports" "$CUSTOM_BIN"
   commit_transaction
 }
-certificate_check(){
-  local check=$1
-  command -v python3 >/dev/null || die 'Certificate audit requires python3; no changes made.'
-  [[ -r $SCRIPT_DIR/certificate-check.py ]] || die 'Keep certificate-check.py next to manage-caddy.sh.'
-  python3 -B "$SCRIPT_DIR/certificate-check.py" "$check"
-}
 setup_cmd(){
   local mode=$1 source=${CADDY_CUSTOM_BINARY:-} p
-  # Must precede validation (which can provision storage), backup, stop and APT.
-  certificate_check migration
   preflight
   if [[ $mode == install ]]; then
     [[ ! -f /etc/systemd/system/caddy.service && ! -x /usr/local/bin/caddy ]] || die 'Legacy installation detected; use migrate.'
@@ -437,7 +435,7 @@ setup_cmd(){
   install_custom_binary "$WORK/caddy"
   migrate_tls
   install_dropin
-  validate_config "$CUSTOM_BIN" caddy
+  validate_config "$CUSTOM_BIN" sing-box
   systemctl enable caddy.service
   systemctl restart caddy.service
   health "$WORK/ports" "$CUSTOM_BIN"
@@ -474,21 +472,16 @@ check_cmd(){
   preflight
   check_modules
   check_service_contract
-  validate_config "$CADDY_BIN" caddy
+  validate_config "$CADDY_BIN" sing-box
   health "$WORK/ports" "$CADDY_BIN"
   log 'Caddy checks passed.'
 }
 usage(){
-  printf '%s\n' "Usage: $0 {install|migrate|upgrade|rollback [BACKUP_DIR]|check|status|check-cert-paths|check-cert-access}" \
+  printf '%s\n' "Usage: $0 {install|migrate|upgrade|rollback [BACKUP_DIR]|check|status}" \
     'Fresh install: sudo env CADDY_CUSTOM_BINARY=/path/caddy CADDY_REQUIRED_PORTS="tcp:80 tcp:443" bash caddy/manage-caddy.sh install' \
     'Upgrade prerequisites: current Go, xcaddy, curl; no experimental caddy upgrade is used.'
 }
 main(){
-  # These commands are genuinely read-only: no lock, backup directory, tmp or systemd.
-  case ${1:-} in
-    check-cert-paths) require_root; certificate_check paths; return ;;
-    check-cert-access) require_root; certificate_check access; return ;;
-  esac
   case ${1:-} in install|migrate|upgrade|rollback|check|status) ;; *) usage; return 2;; esac
   [[ ${CADDY_BACKUP_KEEP:-5} =~ ^[1-9][0-9]*$ ]] || die 'CADDY_BACKUP_KEEP must be a positive integer.'
   init

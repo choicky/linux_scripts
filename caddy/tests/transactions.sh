@@ -30,7 +30,7 @@ run_case(){
         (cd "$ROOT"; command cp -a --parents "$src" "$dst")
       else command cp "$@"; fi
     }
-    # Production binaries are root-owned; tests use the invoking user's ownership.
+    # Windows cannot model Unix ownership; record ownership calls separately.
     install(){
       if [[ ${1:-} == -o ]]; then shift 4; fi
       if [[ $1 == -d ]]; then shift 3; mkdir -p "$@"; else shift 2; command cp "$@"; fi
@@ -44,7 +44,7 @@ run_case(){
     printf 'legacy binary\n' >"$ROOT/usr/local/bin/caddy"
     printf 'old config\n' >"$CONFIG"
     printf 'old private data\n' >"$LEGACY_DATA/fixture"
-    printf 'legacy unit\n' >"$ROOT/etc/systemd/system/caddy.service"
+    printf 'legacy unit\nUser=www-data\nGroup=www-data\n' >"$ROOT/etc/systemd/system/caddy.service"
     printf 'legacy override\n' >"$DROPIN"
     systemctl(){
       printf '%s\n' "$*" >>"$ROOT/systemctl.log"
@@ -55,13 +55,17 @@ run_case(){
           case $* in
             *MainPID*) echo "$$" ;;
             *LoadState*) echo loaded ;;
-            *User*|*Group*) echo caddy ;;
+            *User*|*Group*)
+              if [[ -f $ROOT/etc/systemd/system/caddy.service ]]; then echo www-data; else echo sing-box; fi ;;
+            *Environment*) echo "HOME=$ROOT/var/lib/caddy" ;;
+            *ExecStart*) echo "$CADDY_BIN run --config $CONFIG --adapter jsonc" ;;
+            *ExecReload*) echo "$CADDY_BIN reload --config $CONFIG --adapter jsonc --force" ;;
             *) echo 'fixture state' ;;
           esac ;;
         cat) echo 'fixture unit' ;;
         stop) [[ ${FAIL_STOP:-0} == 0 ]] || return 1; ACTIVE=inactive ;;
         restart)
-          [[ $name != upgrade_restart ]] || return 1
+          [[ $name != upgrade_restart && $name != migrate_restart ]] || return 1
           ACTIVE=active ;;
         start) ACTIVE=active ;;
         enable) ENABLED=enabled ;;
@@ -89,25 +93,71 @@ run_case(){
         --auto) ln -sf "$CUSTOM_BIN" "$CADDY_BIN" ;;
       esac
     }
-    validate_config(){ [[ ${FAIL_VALIDATE:-0} == 0 ]]; }
+    chown(){ printf '%s\n' "$*" >>"$ROOT/chown.log"; }
+    validate_config(){
+      printf '%s\n' "${2:-root}" >>"$ROOT/validate-users.log"
+      [[ ${FAIL_VALIDATE:-0} == 0 ]]
+    }
     listeners(){ printf 'tcp:443\n'; }
     health(){ [[ $ACTIVE == active ]]; }
     case "$name" in
-      migration_guard|migration_acl_error)
-        certificate_check(){
-          echo "certificate-check $1" >"$ROOT/gate.log"
-          if [[ $name == migration_guard ]]; then return 1; else return 2; fi
-        }
-        preflight(){ echo 'unexpected-preflight' >"$ROOT/mutated"; return 1; }
+      missing_user)
+        getent(){ return 2; }
         trap 'finish >"$ROOT/finish.log" 2>&1' EXIT
         setup_cmd migrate
         ;;
-      readonly_paths|readonly_acl)
-        require_root(){ :; }
-        init(){ echo 'unexpected-init' >"$ROOT/mutated"; return 1; }
-        certificate_check(){ echo "$1" >"$ROOT/readonly.log"; }
-        if [[ $name == readonly_paths ]]; then main check-cert-paths; else main check-cert-access; fi
-        [[ ! -e $ROOT/mutated ]]
+      storage)
+        printf '{"storage":{"module":"file_system","root":"%s"}}\n' "$LEGACY_DATA" >"$CONFIG"
+        printf 'newer certificate\n' >"$CADDY_DATA/fixture"
+        migrate_tls
+        migrate_tls
+        grep -Fq "$CADDY_DATA" "$CONFIG"
+        grep -q 'newer certificate' "$CADDY_DATA/fixture"
+        grep -q 'old private data' "$LEGACY_DATA/fixture"
+        grep -q -- "-R sing-box:sing-box $ROOT/var/lib/caddy" "$ROOT/chown.log"
+        grep -q -- "root:sing-box $ROOT/etc/caddy $CONFIG" "$ROOT/chown.log"
+        rm -rf "$LEGACY_DATA"
+        migrate_tls
+        rm -f "$ROOT/etc/systemd/system/caddy.service"
+        install_dropin
+        grep -Fxq 'User=sing-box' "$DROPIN"
+        grep -Fxq 'Group=sing-box' "$DROPIN"
+        grep -Fxq "Environment=HOME=$ROOT/var/lib/caddy" "$DROPIN"
+        ;;
+      migrate_success|migrate_validate|migrate_restart|install_success)
+        # Full setup flow with isolated APT/systemd/identity doubles.
+        printf '#!/bin/sh\nexit 0\n' >"$ROOT/usr/local/bin/caddy"
+        chmod +x "$ROOT/usr/local/bin/caddy"
+        printf '{"storage":{"module":"file_system","root":"%s"}}\n' "$LEGACY_DATA" >"$CONFIG"
+        mkdir -p "$ROOT/etc/sing-box" "$ROOT/usr/lib/systemd/system"
+        printf 'unchanged /home/tls reference\n' >"$ROOT/etc/sing-box/config.json"
+        printf 'official sing-box unit\n' >"$ROOT/usr/lib/systemd/system/sing-box.service"
+        preflight(){ :; }
+        check_modules(){ :; }
+        validate_config(){
+          printf '%s\n' "${2:-root}" >>"$ROOT/validate-users.log"
+          [[ $name != migrate_validate || ${2:-root} != sing-box ]]
+        }
+        install_official_repo(){ printf 'APT binary\n' >"$CADDY_BIN"; }
+        trap 'finish >"$ROOT/finish.log" 2>&1' EXIT
+        if [[ $name == install_success ]]; then
+          mv "$ROOT/usr/local/bin/caddy" "$WORK/source"
+          CADDY_CUSTOM_BINARY="$WORK/source"
+          rm -f "$ROOT/etc/systemd/system/caddy.service"
+          rm -rf "$LEGACY_DATA"
+          printf '{}\n' >"$CONFIG"
+          setup_cmd install
+        else
+          setup_cmd migrate
+        fi
+        [[ $TRANSACTION == 0 && $(cat "$BACKUP/result") == committed ]]
+        grep -Fxq 'User=sing-box' "$DROPIN"
+        grep -Fxq 'Group=sing-box' "$DROPIN"
+        grep -q sing-box "$ROOT/validate-users.log"
+        grep -q -- "-R sing-box:sing-box $ROOT/var/lib/caddy" "$ROOT/chown.log"
+        grep -Fxq 'unchanged /home/tls reference' "$ROOT/etc/sing-box/config.json"
+        grep -Fxq 'official sing-box unit' "$ROOT/usr/lib/systemd/system/sing-box.service"
+        if grep -q 'sing-box.service' "$ROOT/systemctl.log"; then exit 1; fi
         ;;
       upgrade_*)
         rm -f "$ROOT/etc/systemd/system/caddy.service"
@@ -120,7 +170,6 @@ run_case(){
         printf 'Name: caddy\nLink: %s\nStatus: manual\nValue: %s\nAlternative: %s\nPriority: 50\n' "$CADDY_BIN" "$CUSTOM_BIN" "$CUSTOM_BIN" >"$WORK/alternatives"
         command cp "$WORK/alternatives" "$ROOT/alt"
         preflight(){ :; }
-        check_service_contract(){ :; }
         readlink(){
           if [[ ${*: -1} == /proc/*/exe || ${*: -1} == "$CADDY_BIN" ]]; then echo "$CUSTOM_BIN"; else command readlink "$@"; fi
         }
@@ -131,6 +180,7 @@ run_case(){
         # Skip Unix mode changes on Windows; binary bytes/rename still exercised.
         chmod(){ :; }
         validate_config(){
+          [[ ${2:-} == sing-box ]] || return 1
           [[ $name != upgrade_validate || $1 != "$WORK/caddy" ]]
         }
         health(){
@@ -159,14 +209,14 @@ run_case(){
           trap 'finish >"$ROOT/finish.log" 2>&1' EXIT
           false
         fi
-        # Recovery must never depend on the sing-box path/ACL preflight gate.
-        certificate_check(){ die 'Unexpected certificate gate during rollback.'; }
         restore_backup "$BACKUP"
         TRANSACTION=0
         grep -q 'old config' "$CONFIG"
         grep -q 'legacy unit' "$ROOT/etc/systemd/system/caddy.service"
         grep -q 'legacy override' "$DROPIN"
         grep -q 'old private data' "$LEGACY_DATA/fixture"
+        grep -q -- "--reference=$BACKUP/files/var/lib/caddy $ROOT/var/lib/caddy" "$ROOT/chown.log"
+        if [[ $ACTIVE == active ]]; then grep -q www-data "$ROOT/validate-users.log"; fi
         [[ -f $LEGACY_DATA/new-fixture && ! -e $CUSTOM_BIN ]]
         [[ $DIVERT == "$CADDY_BIN" && -f $CADDY_BIN && ! -e $DEFAULT_BIN ]]
         if [[ $name == inactive ]]; then [[ $ACTIVE == inactive && $ENABLED == disabled ]]; else [[ $ACTIVE == active ]]; fi
@@ -234,25 +284,29 @@ for name in upgrade_build upgrade_validate upgrade_atomic upgrade_restart upgrad
   if [[ $name == upgrade_build || $name == upgrade_validate ]]; then
     if grep -q 'restart\|stop' "$SANDBOX/$name/systemctl.log"; then exit 1; fi
   else
-    grep -q 'restored and verified' "$SANDBOX/$name/finish.log"
+    grep -q 'restored and verified' "$SANDBOX/$name/finish.log" || { cat "$SANDBOX/$name.log" "$SANDBOX/$name/finish.log"; exit 1; }
   fi
   echo "PASS: $name keeps/restores old binary"
 done
 
-for name in migration_guard migration_acl_error; do
+for name in storage migrate_success install_success; do
+  run_case "$name"
+  echo "PASS: $name uses shared user without touching sing-box"
+done
+for name in missing_user migrate_validate migrate_restart; do
   set +e
   run_case "$name" >"$SANDBOX/$name.log" 2>&1
   rc=$?
   set -e
   [[ $rc != 0 ]]
-  [[ ! -e $SANDBOX/$name/mutated && ! -e $SANDBOX/$name/systemctl.log ]]
-  [[ -z $(find "$SANDBOX/$name/var/backups/caddy-manager" -mindepth 1 -print -quit) ]]
-  grep -q 'old config' "$SANDBOX/$name/etc/caddy/caddy.jsonc"
-  grep -q 'old private data' "$SANDBOX/$name/home/tls/fixture"
-  grep -q 'legacy unit' "$SANDBOX/$name/etc/systemd/system/caddy.service"
-  echo "PASS: $name aborts before validation/backup/service/storage changes"
-done
-for name in readonly_paths readonly_acl; do
-  run_case "$name"
-  echo "PASS: $name bypasses all mutating initialization"
+  grep -q 'User=www-data' "$SANDBOX/$name/etc/systemd/system/caddy.service"
+  if [[ $name == missing_user ]]; then
+    [[ ! -f $SANDBOX/$name/systemctl.log ]]
+  else
+    grep -q 'restored and verified' "$SANDBOX/$name/finish.log" || { cat "$SANDBOX/$name/finish.log"; exit 1; }
+    grep -q www-data "$SANDBOX/$name/validate-users.log"
+    grep -q -- '--reference=' "$SANDBOX/$name/chown.log"
+    grep -Fxq 'unchanged /home/tls reference' "$SANDBOX/$name/etc/sing-box/config.json"
+  fi
+  echo "PASS: $name preserves/restores old service and ownership"
 done
