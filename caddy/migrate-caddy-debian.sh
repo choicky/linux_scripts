@@ -35,7 +35,7 @@ log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 on_error() {
-    local exit_code=$?
+    local exit_code="${1:-$?}"
 
     if [[ "${MIGRATION_STARTED}" == true && "${OLD_CADDY_STOPPED}" == true ]]; then
         printf '\nERROR: Caddy migration stopped before completion. Restoring the old Caddy service...\n' >&2
@@ -68,11 +68,11 @@ on_error() {
     exit "${exit_code}"
 }
 
-trap on_error ERR
+trap 'on_error $?' ERR
 
 preflight() {
     [[ ${EUID} -eq 0 ]] || die "Run this script as root."
-    [[ -x "${INSTALLER}" ]] || die "Missing executable installer: ${INSTALLER}"
+    [[ -f "${INSTALLER}" ]] || die "Missing installer: ${INSTALLER}"
     [[ -x "${OLD_BINARY}" ]] || die "Old Caddy binary not found: ${OLD_BINARY}"
     [[ -f "${OLD_UNIT}" ]] || die "Old Caddy unit not found: ${OLD_UNIT}"
     [[ -f "${CONFIG}" ]] || die "Caddy config not found: ${CONFIG}"
@@ -132,7 +132,7 @@ prepare_for_installer() {
 
 run_installer() {
     log "Installing the new Caddy layout"
-    "${INSTALLER}" --no-start
+    bash "${INSTALLER}" --no-start
 }
 
 migrate_storage_and_config() {
