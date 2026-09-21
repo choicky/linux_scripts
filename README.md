@@ -15,6 +15,7 @@ Personal Linux server administration and deployment scripts.
 ## Components
 
 - `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary.
+- `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified.
 - `caddy/migrate-caddy-debian.sh` — one-time migration from the old manual Caddy layout.
 - `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
@@ -58,7 +59,7 @@ JSONC support is built into current Caddy and does not require a separate adapte
 For a new Debian 12/13 server that does not have the old manual Caddy layout:
 
 ```bash
-git clone -b caddy-simple-scripts https://github.com/choicky/linux_scripts.git /root/linux_scripts
+git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
 cd /root/linux_scripts
 
 bash caddy/install-caddy-debian.sh
@@ -92,7 +93,7 @@ git pull --ff-only
 If the repository is not present yet:
 
 ```bash
-git clone -b caddy-simple-scripts https://github.com/choicky/linux_scripts.git /root/linux_scripts
+git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
 cd /root/linux_scripts
 ```
 
@@ -207,6 +208,32 @@ sing-box: User=www-data  Group=www-data
 Typical listener layout used by these servers is Caddy on TCP 80/443/8443 and sing-box on UDP 443. Caddy may also listen on UDP 8443 for HTTP/3 when configured.
 
 Finally test the actual proxy nodes and web/PHP applications. Service status and configuration validation do not replace an end-to-end test.
+
+## Routine Caddy upgrade
+
+After a server uses the standard Caddy layout, routine Caddy upgrades should use:
+
+```bash
+cd /root/linux_scripts
+git pull --ff-only
+bash caddy/update-caddy-debian.sh
+```
+
+The updater deliberately prepares the custom binary **before** changing the APT package. It:
+
+1. refreshes APT metadata and reads the Caddy Stable candidate version;
+2. exits without restarting Caddy when the installed APT version is already current;
+3. downloads the exactly matching `caddy-linux-amd64` or `caddy-linux-arm64` release and `SHA256SUMS` from `choicky/caddy-custom-build`;
+4. verifies SHA256, version, `caddy-l4`, `caddy-cloudflare-ip`, and built-in JSONC support;
+5. validates the current JSONC configuration with the new custom binary as `www-data`;
+6. only then stops/masks Caddy and upgrades the official APT package;
+7. verifies that `/usr/bin/caddy.default` matches the prepared custom version;
+8. replaces `/usr/bin/caddy.custom`, validates again, and restarts Caddy;
+9. restores the previous custom binary and attempts to restart the previous runtime if a failure occurs after Caddy has been stopped.
+
+If the matching custom GitHub Release does not exist yet, the script stops **before** changing the installed APT package or running service. Build/release that Caddy version first, then rerun the updater.
+
+Do not use `install-caddy-debian.sh` as the normal upgrade command once the standard layout is installed.
 
 ## Backups and old TLS storage
 
