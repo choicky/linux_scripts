@@ -108,8 +108,8 @@ preflight() {
     [[ -f "${CONFIG}" ]] || die "Caddy config not found: ${CONFIG}"
     [[ -d "${OLD_STORAGE}" ]] || die "Old Caddy storage not found: ${OLD_STORAGE}"
 
-    getent passwd sing-box >/dev/null ||
-        die "User 'sing-box' does not exist. Install official sing-box first."
+    getent passwd www-data >/dev/null ||
+        die "User 'www-data' does not exist."
 
     systemctl is-active --quiet caddy ||
         die "Old caddy.service is not active; inspect the server before migrating."
@@ -185,11 +185,11 @@ run_installer() {
 migrate_storage_and_config() {
     log "Migrating Caddy storage"
 
-    install -d -o sing-box -g sing-box -m 0700 "${NEW_STORAGE}"
+    install -d -o www-data -g www-data -m 0700 "${NEW_STORAGE}"
 
     # Copy, do not move: /home/tls remains an untouched rollback source.
     cp -a "${OLD_STORAGE}/." "${NEW_STORAGE}/"
-    chown -R sing-box:sing-box /var/lib/caddy
+    chown -R www-data:www-data /var/lib/caddy
 
     # Rewrite only the JSONC FileStorage root. Domain names differ between
     # servers, so migration must not depend on any certificate/domain path.
@@ -199,14 +199,14 @@ migrate_storage_and_config() {
     grep -Eq '"root"[[:space:]]*:[[:space:]]*"/var/lib/caddy/.local/share/caddy"' "${CONFIG}" ||
         die "Failed to rewrite the Caddy storage root."
 
-    chown root:sing-box "${CONFIG}"
+    chown root:www-data "${CONFIG}"
     chmod 0640 "${CONFIG}"
 }
 
 validate_and_start() {
     log "Validating migrated configuration"
 
-    runuser -u sing-box -- env HOME=/var/lib/caddy \
+    runuser -u www-data -- env HOME=/var/lib/caddy \
         /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
 
     systemctl unmask caddy >/dev/null
