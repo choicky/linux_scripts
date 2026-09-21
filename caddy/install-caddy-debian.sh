@@ -217,7 +217,9 @@ validate_installation() {
     grep -Fq "${MODULE_CF_IP}" <<<"${modules}" || die "Missing caddy-cloudflare-ip."
     grep -Fq "${MODULE_JSONC}" <<<"${modules}" || die "Missing jsonc-adapter."
 
-    if [[ -f "${CONFIG}" ]]; then
+    if [[ "${NO_START}" == true ]]; then
+        log "Configuration validation skipped by --no-start."
+    elif [[ -f "${CONFIG}" ]]; then
         runuser -u sing-box -- env HOME=/var/lib/caddy \
             /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
     else
@@ -227,7 +229,7 @@ validate_installation() {
 
 start_caddy() {
     if [[ "${NO_START}" == true ]]; then
-        log "Caddy installed; validation/start skipped by --no-start."
+        log "Caddy installed; start skipped by --no-start."
         return
     fi
 
