@@ -28,8 +28,23 @@ readonly NEW_STORAGE="/var/lib/caddy/.local/share/caddy"
 readonly BACKUP_ROOT="/root/caddy-migration-backup"
 readonly BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
 
+MIGRATION_STARTED=false
+
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+on_error() {
+    local exit_code=$?
+    if [[ "${MIGRATION_STARTED}" == true ]]; then
+        printf '\nERROR: Caddy migration stopped before completion.\n' >&2
+        printf 'Backup: %s\n' "${BACKUP_DIR}" >&2
+        printf 'Old TLS storage is still retained at: %s\n' "${OLD_STORAGE}" >&2
+        printf 'Do not delete either path. Inspect the error above before retrying.\n' >&2
+    fi
+    exit "${exit_code}"
+}
+
+trap on_error ERR
 
 preflight() {
     [[ ${EUID} -eq 0 ]] || die "Run this script as root."
@@ -81,6 +96,7 @@ prepare_for_installer() {
     log "Stopping old Caddy and preserving the old systemd unit"
 
     systemctl stop caddy
+    MIGRATION_STARTED=true
 
     # The clean installer rejects /usr/local/bin/caddy and an already installed
     # Caddy package. Keep the old binary in the timestamped backup and remove
@@ -166,6 +182,7 @@ main() {
     migrate_storage_and_config
     validate_and_start
     check_sing_box_references
+    MIGRATION_STARTED=false
 }
 
 main "$@"
