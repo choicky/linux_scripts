@@ -29,18 +29,35 @@ readonly BACKUP_ROOT="/root/caddy-migration-backup"
 readonly BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
 
 MIGRATION_STARTED=false
+OLD_CADDY_STOPPED=false
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 on_error() {
     local exit_code=$?
-    if [[ "${MIGRATION_STARTED}" == true ]]; then
-        printf '\nERROR: Caddy migration stopped before completion.\n' >&2
+
+    if [[ "${MIGRATION_STARTED}" == true && "${OLD_CADDY_STOPPED}" == true ]]; then
+        printf '\nERROR: Caddy migration stopped before completion. Restoring the old Caddy service...\n' >&2
+
+        # Keep any APT packages already installed. Restore only the old manual
+        # binary and unit that this migration moved out of the live paths.
+        if [[ -f "${BACKUP_DIR}/caddy.old" && -f "${BACKUP_DIR}/caddy.service.old" ]]; then
+            cp -a "${BACKUP_DIR}/caddy.old" "${OLD_BINARY}"
+            cp -a "${BACKUP_DIR}/caddy.service.old" "${OLD_UNIT}"
+            systemctl daemon-reload
+            if systemctl start caddy; then
+                printf 'Old Caddy service restored and started.\n' >&2
+            else
+                printf 'WARNING: automatic restoration could not start old Caddy.\n' >&2
+                systemctl --no-pager --full status caddy >&2 || true
+            fi
+        fi
+
         printf 'Backup: %s\n' "${BACKUP_DIR}" >&2
-        printf 'Old TLS storage is still retained at: %s\n' "${OLD_STORAGE}" >&2
-        printf 'Do not delete either path. Inspect the error above before retrying.\n' >&2
+        printf 'Old TLS storage retained: %s\n' "${OLD_STORAGE}" >&2
     fi
+
     exit "${exit_code}"
 }
 
@@ -97,6 +114,7 @@ prepare_for_installer() {
 
     systemctl stop caddy
     MIGRATION_STARTED=true
+    OLD_CADDY_STOPPED=true
 
     # The clean installer rejects /usr/local/bin/caddy and an already installed
     # Caddy package. Keep the old binary in the timestamped backup and remove
@@ -182,6 +200,7 @@ main() {
     migrate_storage_and_config
     validate_and_start
     check_sing_box_references
+    OLD_CADDY_STOPPED=false
     MIGRATION_STARTED=false
 }
 
