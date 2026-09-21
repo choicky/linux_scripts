@@ -40,6 +40,10 @@ install_caddy(){
   chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" caddy
+
+  # A previous successful run may already have diverted the package binary and
+  # selected /usr/bin/caddy.custom. In that state the package-managed binary is
+  # /usr/bin/caddy.default; both fresh installs and retries are supported.
   systemctl stop caddy
   systemctl disable caddy >/dev/null 2>&1 || true
 }
@@ -76,8 +80,12 @@ setup_custom_binary(){
 
   # Keep the package-managed binary behind a dpkg diversion. Do not combine
   # must have one unambiguous destination for the stock binary.
-  if ! dpkg-divert --list /usr/bin/caddy | grep -Fq "$CADDY_DEFAULT"; then
+  local diversion
+  diversion="$(dpkg-divert --listpackage /usr/bin/caddy 2>/dev/null || true)"
+  if [[ -z "$diversion" ]]; then
     dpkg-divert --add --rename --divert "$CADDY_DEFAULT" /usr/bin/caddy
+  elif ! dpkg-divert --list /usr/bin/caddy | grep -Fq "$CADDY_DEFAULT"; then
+    die "Unexpected existing dpkg diversion for /usr/bin/caddy; inspect it manually."
   fi
 
   [[ -x "$CADDY_DEFAULT" && -x "$CADDY_CUSTOM" ]] || die "Caddy binaries are incomplete."
