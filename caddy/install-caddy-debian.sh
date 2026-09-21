@@ -24,8 +24,7 @@ preflight(){
   . /etc/os-release
   [[ ${ID:-} == debian ]] || die "Only Debian is supported."
   case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
-  getent passwd sing-box >/dev/null || die "User 'sing-box' does not exist. Install official sing-box first."
-  getent group sing-box >/dev/null || die "Group 'sing-box' does not exist. Install official sing-box first."
+  getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
   [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture: $(dpkg --print-architecture). Only amd64 and arm64 are provided.";; esac
@@ -105,8 +104,8 @@ setup_service(){
   install -d -m 0755 "$DROPIN_DIR"
   cat >"$DROPIN_FILE" <<'EOF'
 [Service]
-User=sing-box
-Group=sing-box
+User=www-data
+Group=www-data
 Environment=HOME=/var/lib/caddy
 ExecStart=
 ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/caddy.jsonc --adapter jsonc
@@ -117,24 +116,22 @@ EOF
 }
 
 prepare_paths(){
-  # Caddy runs as sing-box but PHP-FPM's Debian socket is normally
-  # www-data:www-data 0660. Keep the vendor PHP-FPM setup unchanged and grant
-  # Caddy access through sing-box's supplementary www-data membership.
-  usermod -aG www-data sing-box
-
-  install -d -o sing-box -g sing-box -m 0700 /var/lib/caddy
-  chown -R sing-box:sing-box /var/lib/caddy
-  install -d -o sing-box -g sing-box -m 0750 /var/log/caddy
-  chown -R sing-box:sing-box /var/log/caddy
-  chown root:sing-box /etc/caddy; chmod 0750 /etc/caddy
-  if [[ -f "$CONFIG" ]]; then chown root:sing-box "$CONFIG"; chmod 0640 "$CONFIG"; fi
+  # Caddy and PHP-FPM use the standard Debian web-service identity. sing-box is
+  # configured the same way by install-sing-box-debian.sh, so all three can
+  # access Caddy-managed certificates without ACLs or permission-sync scripts.
+  install -d -o www-data -g www-data -m 0700 /var/lib/caddy
+  chown -R www-data:www-data /var/lib/caddy
+  install -d -o www-data -g www-data -m 0750 /var/log/caddy
+  chown -R www-data:www-data /var/log/caddy
+  chown root:www-data /etc/caddy; chmod 0750 /etc/caddy
+  if [[ -f "$CONFIG" ]]; then chown root:www-data "$CONFIG"; chmod 0640 "$CONFIG"; fi
 }
 
 validate_installation(){
   log "Validating installed Caddy"
   /usr/bin/caddy version
   [[ "$NO_START" == true ]] && { log "Configuration validation skipped by --no-start."; return; }
-  [[ -f "$CONFIG" ]] && runuser -u sing-box -- env HOME=/var/lib/caddy /usr/bin/caddy validate --config "$CONFIG" --adapter jsonc
+  [[ -f "$CONFIG" ]] && runuser -u www-data -- env HOME=/var/lib/caddy /usr/bin/caddy validate --config "$CONFIG" --adapter jsonc
 }
 
 start_caddy(){
