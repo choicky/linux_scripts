@@ -8,7 +8,6 @@ readonly DROPIN_DIR="/etc/systemd/system/caddy.service.d"
 readonly DROPIN_FILE="${DROPIN_DIR}/override.conf"
 readonly CADDY_DEFAULT="/usr/bin/caddy.default"
 readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
-readonly CADDY_CUSTOM="/usr/bin/caddy.custom"\nreadonly CADDY_PACKAGE="/usr/bin/caddy.package"
 readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
@@ -76,7 +75,6 @@ setup_custom_binary(){
   log "Registering stock and custom Caddy binaries"
 
   # Keep the package-managed binary behind a dpkg diversion. Do not combine
-  # dpkg-divert with update-alternatives on /usr/bin/caddy: package upgrades
   # must have one unambiguous destination for the stock binary.
   if ! dpkg-divert --list /usr/bin/caddy | grep -Fq "$CADDY_DEFAULT"; then
     dpkg-divert --add --rename --divert "$CADDY_DEFAULT" /usr/bin/caddy
