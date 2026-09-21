@@ -33,6 +33,13 @@ preflight(){
 
 install_caddy(){
   log "Installing Caddy Stable from the official APT repository"
+
+  # Never let the package post-install action start the vendor Caddyfile during
+  # installation/upgrade. start_caddy() unmasks the service only after the
+  # custom binary, drop-in and configuration have been prepared and validated.
+  systemctl stop caddy >/dev/null 2>&1 || true
+  systemctl mask caddy >/dev/null
+
   apt-get update
   apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -124,8 +131,9 @@ validate_installation(){
 }
 
 start_caddy(){
-  [[ "$NO_START" == true ]] && { log "Caddy installed; start skipped by --no-start."; return; }
-  [[ -f "$CONFIG" ]] || { log "Caddy is installed but remains disabled because $CONFIG is absent."; return; }
+  [[ "$NO_START" == true ]] && { log "Caddy installed; service remains masked and start is skipped by --no-start."; return; }
+  [[ -f "$CONFIG" ]] || { log "Caddy is installed but remains masked because $CONFIG is absent."; return; }
+  systemctl unmask caddy >/dev/null
   systemctl enable caddy
   if ! systemctl restart caddy; then systemctl --no-pager --full status caddy || true; journalctl -u caddy -n 50 --no-pager || true; die "Caddy failed to start."; fi
   systemctl is-active --quiet caddy || die "Caddy is not active."
