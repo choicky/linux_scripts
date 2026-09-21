@@ -44,4 +44,4 @@ cat "$tmp" >"${BASHRC}"
 chmod 0644 "${BASHRC}"
 
 printf 'Root Bash colors configured in %s.\n' "${BASHRC}"
-printf 'Run: source /root/.bashrc\n'
+printf 'Apply to the current shell with: source /root/.bashrc\n'
