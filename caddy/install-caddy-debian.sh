@@ -63,8 +63,11 @@ install_caddy() {
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
         gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt'         -o /etc/apt/sources.list.d/caddy-stable.list
-    chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg         /etc/apt/sources.list.d/caddy-stable.list
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        -o /etc/apt/sources.list.d/caddy-stable.list
+    chmod 0644 \
+        /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+        /etc/apt/sources.list.d/caddy-stable.list
 
     apt-get update
     apt-get install -y caddy
@@ -79,8 +82,11 @@ install_xcaddy() {
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/gpg.key' |
         gpg --dearmor --yes -o /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/debian.deb.txt'         -o /etc/apt/sources.list.d/caddy-xcaddy.list
-    chmod 0644 /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg         /etc/apt/sources.list.d/caddy-xcaddy.list
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/debian.deb.txt' \
+        -o /etc/apt/sources.list.d/caddy-xcaddy.list
+    chmod 0644 \
+        /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg \
+        /etc/apt/sources.list.d/caddy-xcaddy.list
 
     apt-get update
     apt-get install -y xcaddy
@@ -93,7 +99,11 @@ build_custom_caddy() {
     tmpdir="$(mktemp -d)"
     trap 'rm -rf "$tmpdir"' RETURN
 
-    xcaddy build latest         --output "${tmpdir}/caddy"         --with "${MODULE_L4}"         --with "${MODULE_CF_IP}"         --with "${MODULE_JSONC}"
+    xcaddy build latest \
+        --output "${tmpdir}/caddy" \
+        --with "${MODULE_L4}" \
+        --with "${MODULE_CF_IP}" \
+        --with "${MODULE_JSONC}"
 
     [[ -x "${tmpdir}/caddy" ]] || die "xcaddy build failed."
 
@@ -115,7 +125,10 @@ setup_custom_binary() {
     # upgrades can continue updating that diverted file without overwriting the
     # selected custom binary.
     if [[ ! -e "${CADDY_DEFAULT}" ]]; then
-        dpkg-divert --package caddy --divert "${CADDY_DEFAULT}" --rename /usr/bin/caddy
+        # Follow Caddy's documented Debian custom-build procedure. This is a
+        # local administrator diversion, so package upgrades keep the stock
+        # binary at caddy.default instead of replacing our selected binary.
+        dpkg-divert --divert "${CADDY_DEFAULT}" --rename /usr/bin/caddy
     fi
 
     [[ -x "${CADDY_DEFAULT}" ]] || die "Official Caddy binary is missing."
@@ -156,6 +169,16 @@ prepare_paths() {
 
     install -d -o sing-box -g sing-box -m 0700 /var/lib/caddy
 
+    # The Debian package starts Caddy once during installation. It may therefore
+    # already have created files below /var/lib/caddy as user caddy. Caddy will
+    # run as sing-box after our drop-in, so normalize the fresh data tree.
+    chown -R sing-box:sing-box /var/lib/caddy
+
+    # Runtime logs normally go to journald. Our JSONC configurations may also
+    # use file outputs such as /var/log/caddy/error.log, so create only the
+    # containing directory and let Caddy create/rotate the actual log files.
+    install -d -o sing-box -g sing-box -m 0750 /var/log/caddy
+
     # Configuration stays root-managed; the Caddy runtime only needs read
     # access. The configuration file may be deployed after this installer.
     chown root:sing-box /etc/caddy
@@ -178,7 +201,8 @@ validate_installation() {
     grep -Fq "${MODULE_JSONC}" <<<"${modules}" || die "Missing jsonc-adapter."
 
     if [[ -f "${CONFIG}" ]]; then
-        runuser -u sing-box -- env HOME=/var/lib/caddy             /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
+        runuser -u sing-box -- env HOME=/var/lib/caddy \
+            /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
     else
         log "${CONFIG} does not exist; configuration validation is skipped."
     fi
