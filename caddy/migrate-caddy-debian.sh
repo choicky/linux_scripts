@@ -31,6 +31,13 @@ readonly BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
 MIGRATION_STARTED=false
 OLD_CADDY_STOPPED=false
 OLD_CADDY_ENABLED=false
+OLD_ETC_CADDY_OWNER=""
+OLD_ETC_CADDY_MODE=""
+OLD_CONFIG_OWNER=""
+OLD_CONFIG_MODE=""
+OLD_LOG_CADDY_EXISTS=false
+OLD_LOG_CADDY_OWNER=""
+OLD_LOG_CADDY_MODE=""
 
 log() { printf '\n==> %s\n' "$*"; }
 die() {
@@ -60,6 +67,15 @@ on_error() {
             # restored old unit, so remove only that migration-created drop-in.
             rm -f /etc/systemd/system/caddy.service.d/override.conf
             rmdir /etc/systemd/system/caddy.service.d 2>/dev/null || true
+
+            chown "${OLD_ETC_CADDY_OWNER}" /etc/caddy
+            chmod "${OLD_ETC_CADDY_MODE}" /etc/caddy
+            chown "${OLD_CONFIG_OWNER}" "${CONFIG}"
+            chmod "${OLD_CONFIG_MODE}" "${CONFIG}"
+            if [[ "${OLD_LOG_CADDY_EXISTS}" == true && -d /var/log/caddy ]]; then
+                chown -R "${OLD_LOG_CADDY_OWNER}" /var/log/caddy
+                chmod "${OLD_LOG_CADDY_MODE}" /var/log/caddy
+            fi
 
             systemctl daemon-reload
             if [[ "${OLD_CADDY_ENABLED}" == true ]]; then
@@ -100,6 +116,16 @@ preflight() {
 
     if systemctl is-enabled --quiet caddy; then
         OLD_CADDY_ENABLED=true
+    fi
+
+    OLD_ETC_CADDY_OWNER="$(stat -c '%U:%G' /etc/caddy)"
+    OLD_ETC_CADDY_MODE="$(stat -c '%a' /etc/caddy)"
+    OLD_CONFIG_OWNER="$(stat -c '%U:%G' "${CONFIG}")"
+    OLD_CONFIG_MODE="$(stat -c '%a' "${CONFIG}")"
+    if [[ -d /var/log/caddy ]]; then
+        OLD_LOG_CADDY_EXISTS=true
+        OLD_LOG_CADDY_OWNER="$(stat -c '%U:%G' /var/log/caddy)"
+        OLD_LOG_CADDY_MODE="$(stat -c '%a' /var/log/caddy)"
     fi
 
     # All of these VPSes use the same Caddy FileStorage layout, although their
