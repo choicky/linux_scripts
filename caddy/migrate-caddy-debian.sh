@@ -81,10 +81,6 @@ preflight() {
     getent passwd sing-box >/dev/null ||
         die "User 'sing-box' does not exist. Install official sing-box first."
 
-    if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q "install ok installed"; then
-        die "APT Caddy is already installed; refusing automatic migration."
-    fi
-
     systemctl is-active --quiet caddy ||
         die "Old caddy.service is not active; inspect the server before migrating."
 
