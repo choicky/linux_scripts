@@ -49,8 +49,16 @@ preflight() {
     systemctl is-active --quiet caddy ||
         die "Old caddy.service is not active; inspect the server before migrating."
 
-    grep -Fq '/home/tls' "${CONFIG}" ||
-        die "The config does not reference /home/tls; inspect it before migrating."
+    # All of these VPSes use the same Caddy FileStorage layout, although their
+    # domain names differ. Require the legacy root to be configured explicitly
+    # and verify the expected FileStorage subdirectories rather than matching
+    # any domain name.
+    grep -Eq '"root"[[:space:]]*:[[:space:]]*"/home/tls"' "${CONFIG}" ||
+        die "Caddy storage root is not /home/tls; inspect it before migrating."
+    [[ -d "${OLD_STORAGE}/certificates" ]] ||
+        die "Missing ${OLD_STORAGE}/certificates."
+    [[ -d "${OLD_STORAGE}/acme" ]] ||
+        die "Missing ${OLD_STORAGE}/acme."
 }
 
 backup_old_installation() {
@@ -99,10 +107,13 @@ migrate_storage_and_config() {
     cp -a "${OLD_STORAGE}/." "${NEW_STORAGE}/"
     chown -R sing-box:sing-box /var/lib/caddy
 
-    # Rewrite only the known legacy storage root. Keep a post-install copy of
-    # the config before changing it.
+    # Rewrite only the JSONC FileStorage root. Domain names differ between
+    # servers, so migration must not depend on any certificate/domain path.
     cp -a "${CONFIG}" "${BACKUP_DIR}/caddy.jsonc.before-storage-rewrite"
-    sed -i 's#/home/tls/#/var/lib/caddy/.local/share/caddy/#g; s#/home/tls#/var/lib/caddy/.local/share/caddy#g' "${CONFIG}"
+    sed -Ei 's#("root"[[:space:]]*:[[:space:]]*)"/home/tls"#\\1"/var/lib/caddy/.local/share/caddy"#' "${CONFIG}"
+
+    grep -Eq '"root"[[:space:]]*:[[:space:]]*"/var/lib/caddy/.local/share/caddy"' "${CONFIG}" ||
+        die "Failed to rewrite the Caddy storage root."
 
     chown root:sing-box "${CONFIG}"
     chmod 0640 "${CONFIG}"
