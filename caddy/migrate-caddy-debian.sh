@@ -194,7 +194,7 @@ migrate_storage_and_config() {
     # Rewrite only the JSONC FileStorage root. Domain names differ between
     # servers, so migration must not depend on any certificate/domain path.
     cp -a "${CONFIG}" "${BACKUP_DIR}/caddy.jsonc.before-storage-rewrite"
-    sed -Ei 's#("root"[[:space:]]*:[[:space:]]*)"/home/tls"#\\1"/var/lib/caddy/.local/share/caddy"#' "${CONFIG}"
+    sed -Ei 's#("root"[[:space:]]*:[[:space:]]*)"/home/tls"#\1"/var/lib/caddy/.local/share/caddy"#' "${CONFIG}"
 
     grep -Eq '"root"[[:space:]]*:[[:space:]]*"/var/lib/caddy/.local/share/caddy"' "${CONFIG}" ||
         die "Failed to rewrite the Caddy storage root."
