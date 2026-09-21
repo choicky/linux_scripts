@@ -108,7 +108,9 @@ migrate_cmd(){
   validate_config
   systemctl enable caddy.service
   if ! systemctl restart caddy.service || ! systemctl is-active --quiet caddy.service; then
-    die "Migration validation/start failed. Backup is available under $BACKUP_ROOT; automatic rollback is not enabled yet."
+    warn "Migration failed; attempting legacy runtime rollback."
+    rollback_cmd
+    die "Migration failed; legacy runtime restored."
   fi
   log "Legacy Caddy migration completed. Keep $LEGACY_DATA until post-migration verification is complete."
 }
@@ -131,11 +133,26 @@ install_cmd(){
 }
 
 upgrade_cmd(){ require_root; check_os; die "Upgrade remains safety-gated pending automatic rollback implementation."; }
-rollback_cmd(){ require_root; die "Automatic rollback remains safety-gated. Backups are under $BACKUP_ROOT."; }
+rollback_cmd(){
+  require_root
+  local d="${1:-}"
+  [[ -n "$d" ]] || d="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf "%T@ %p\\n" 2>/dev/null | sort -nr | head -1 | cut -d" " -f2-)"
+  [[ -n "$d" && -d "$d" ]] || die "No usable backup found."
+  systemctl stop caddy.service 2>/dev/null || true
+  rm -rf /etc/systemd/system/caddy.service.d
+  [[ -f "$d/etc/systemd/system/caddy.service" ]] && cp -a "$d/etc/systemd/system/caddy.service" /etc/systemd/system/caddy.service
+  [[ -f "$d/usr/local/bin/caddy" ]] && install -o root -g root -m 0755 "$d/usr/local/bin/caddy" /usr/local/bin/caddy
+  [[ -f "$d/etc/caddy/caddy.jsonc" ]] && cp -a "$d/etc/caddy/caddy.jsonc" "$CONFIG"
+  if [[ -d "$d/home-tls" ]]; then rm -rf "$LEGACY_DATA"; cp -a "$d/home-tls" "$LEGACY_DATA"; fi
+  systemctl daemon-reload
+  systemctl restart caddy.service
+  systemctl is-active --quiet caddy.service || die "Rollback restored legacy files, but Caddy failed to start."
+  log "Legacy runtime restored from: $d"
+}
 
 usage(){
   cat <<EOF
-Usage: $0 {install|migrate|check|upgrade|rollback|status}
+Usage: $0 {install|migrate|check|upgrade|rollback [BACKUP_DIR]|status}
 
 Fresh install:
   CADDY_CUSTOM_BINARY=/path/to/custom-caddy sudo -E $0 install
@@ -150,7 +167,7 @@ case "${1:-}" in
   migrate) migrate_cmd ;;
   check) check_cmd ;;
   upgrade) upgrade_cmd ;;
-  rollback) rollback_cmd ;;
+  rollback) rollback_cmd "${2:-}" ;;
   status) status_cmd ;;
   *) usage; exit 2 ;;
 esac
