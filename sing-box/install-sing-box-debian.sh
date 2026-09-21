@@ -71,7 +71,11 @@ EOF
 }
 
 prepare_paths(){
+  # StateDirectory=sing-box in the vendor unit would otherwise create/repair
+  # /var/lib/sing-box for the vendor User=sing-box. With the User override,
+  # keep the state directory explicitly owned by the selected runtime identity.
   install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
+  chown -R www-data:www-data /var/lib/sing-box
   install -d -o root -g www-data -m 0750 /etc/sing-box
   if [[ -f "$CONFIG" ]]; then
     chown root:www-data "$CONFIG"
