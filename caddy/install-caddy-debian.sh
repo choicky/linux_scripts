@@ -23,8 +23,25 @@ readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
 readonly MODULE_JSONC="github.com/caddyserver/jsonc-adapter"
 
+NO_START=false
+
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    printf 'Usage: %s [--no-start]\n' "$0"
+}
+
+parse_args() {
+    while (( $# )); do
+        case "$1" in
+            --no-start) NO_START=true ;;
+            -h|--help) usage; exit 0 ;;
+            *) usage >&2; die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+}
 
 preflight() {
     [[ ${EUID} -eq 0 ]] || die "Run this script as root."
@@ -209,6 +226,11 @@ validate_installation() {
 }
 
 start_caddy() {
+    if [[ "${NO_START}" == true ]]; then
+        log "Caddy installed; validation/start skipped by --no-start."
+        return
+    fi
+
     if [[ ! -f "${CONFIG}" ]]; then
         # Do not start a production service with an unintended/default config.
         systemctl disable caddy >/dev/null 2>&1 || true
@@ -228,6 +250,7 @@ start_caddy() {
 }
 
 main() {
+    parse_args "$@"
     preflight
     install_caddy
     install_xcaddy
