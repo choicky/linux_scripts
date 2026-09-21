@@ -61,11 +61,9 @@ preflight() {
     getent group sing-box >/dev/null ||
         die "Group 'sing-box' does not exist. Install official sing-box first."
 
-    # Keep this installer clean: an existing package or manual binary belongs
-    # to the one-time migration path, not to the fresh-install path.
-    if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q "install ok installed"; then
-        die "Caddy is already installed. Use the migration/update procedure."
-    fi
+    # A manual installation belongs to the migration path. An existing APT
+    # package is fine: apt-get install is idempotent and also makes retries
+    # after an interrupted migration straightforward.
     [[ ! -e /usr/local/bin/caddy ]] ||
         die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
 
@@ -76,7 +74,7 @@ install_caddy() {
     log "Installing Caddy Stable from the official APT repository"
 
     apt-get update
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
+    apt-get install -y debian-keyring debian-archive-keyring curl gpg
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
         gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
