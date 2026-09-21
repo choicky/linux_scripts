@@ -87,7 +87,7 @@ prepare_for_installer() {
 
 run_installer() {
     log "Installing the new Caddy layout"
-    "${INSTALLER}"
+    "${INSTALLER}" --no-start
 }
 
 migrate_storage_and_config() {
@@ -111,7 +111,8 @@ migrate_storage_and_config() {
 validate_and_start() {
     log "Validating migrated configuration"
 
-    runuser -u sing-box -- env HOME=/var/lib/caddy         /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
+    runuser -u sing-box -- env HOME=/var/lib/caddy \
+        /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
 
     systemctl enable caddy
     systemctl restart caddy
