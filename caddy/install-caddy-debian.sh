@@ -26,6 +26,7 @@ preflight(){
   case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
   getent passwd sing-box >/dev/null || die "User 'sing-box' does not exist. Install official sing-box first."
   getent group sing-box >/dev/null || die "Group 'sing-box' does not exist. Install official sing-box first."
+  getent group www-data >/dev/null || die "Group 'www-data' does not exist."
   [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture: $(dpkg --print-architecture). Only amd64 and arm64 are provided.";; esac
   log "Environment: Debian ${VERSION_ID}, architecture: ${ARCH}"
@@ -116,6 +117,11 @@ EOF
 }
 
 prepare_paths(){
+  # Caddy runs as sing-box but PHP-FPM's Debian socket is normally
+  # www-data:www-data 0660. Keep the vendor PHP-FPM setup unchanged and grant
+  # Caddy access through sing-box's supplementary www-data membership.
+  usermod -aG www-data sing-box
+
   install -d -o sing-box -g sing-box -m 0700 /var/lib/caddy
   chown -R sing-box:sing-box /var/lib/caddy
   install -d -o sing-box -g sing-box -m 0750 /var/log/caddy
