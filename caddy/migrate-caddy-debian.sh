@@ -138,7 +138,24 @@ validate_and_start() {
     printf 'Backup: %s\n' "${BACKUP_DIR}"
     printf 'Old TLS storage retained: %s\n' "${OLD_STORAGE}"
     printf 'New TLS storage: %s\n' "${NEW_STORAGE}"
-    printf '\nIMPORTANT: update sing-box certificate_path/key_path from /home/tls to the new Caddy storage before removing /home/tls.\n'
+}
+
+check_sing_box_references() {
+    [[ -d /etc/sing-box ]] || return
+
+    log "Checking sing-box for legacy /home/tls references"
+
+    local matches
+    matches="$(grep -R -n -F '/home/tls' /etc/sing-box 2>/dev/null || true)"
+
+    if [[ -n "${matches}" ]]; then
+        printf '%s\n' "${matches}"
+        printf '\nIMPORTANT: sing-box still references /home/tls.\n'
+        printf 'Update those certificate/key paths to the new Caddy storage after verifying them.\n'
+        printf 'Do not remove /home/tls until no service references it.\n'
+    else
+        printf 'No /home/tls references found under /etc/sing-box.\n'
+    fi
 }
 
 main() {
@@ -148,6 +165,7 @@ main() {
     run_installer
     migrate_storage_and_config
     validate_and_start
+    check_sing_box_references
 }
 
 main "$@"
