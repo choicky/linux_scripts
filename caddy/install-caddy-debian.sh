@@ -85,7 +85,7 @@ install_caddy() {
         /etc/apt/sources.list.d/caddy-stable.list
 
     apt-get update
-    apt-get install -y caddy
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" caddy
 
     # The package may start the stock service automatically. Stop it until the
     # custom binary, JSONC command line and service identity are ready.
@@ -104,7 +104,7 @@ install_xcaddy() {
         /etc/apt/sources.list.d/caddy-xcaddy.list
 
     apt-get update
-    apt-get install -y xcaddy
+    apt-get install -y golang-go xcaddy
 }
 
 build_custom_caddy() {
