@@ -85,8 +85,8 @@ download_custom_caddy(){
 setup_custom_binary(){
   log "Registering stock and custom Caddy binaries"
 
-  # Keep the package-managed binary behind a dpkg diversion. Do not combine
-  # must have one unambiguous destination for the stock binary.
+  # Keep the package-managed binary behind a dpkg diversion. Package upgrades
+  # then have one unambiguous destination for the stock binary.
   local diversion
   diversion="$(dpkg-divert --listpackage /usr/bin/caddy 2>/dev/null || true)"
   if [[ -z "$diversion" ]]; then
@@ -119,6 +119,7 @@ prepare_paths(){
   install -d -o sing-box -g sing-box -m 0700 /var/lib/caddy
   chown -R sing-box:sing-box /var/lib/caddy
   install -d -o sing-box -g sing-box -m 0750 /var/log/caddy
+  chown -R sing-box:sing-box /var/log/caddy
   chown root:sing-box /etc/caddy; chmod 0750 /etc/caddy
   if [[ -f "$CONFIG" ]]; then chown root:sing-box "$CONFIG"; chmod 0640 "$CONFIG"; fi
 }
