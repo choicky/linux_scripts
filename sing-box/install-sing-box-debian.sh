@@ -81,6 +81,11 @@ prepare_paths(){
   # keep the state directory explicitly owned by the selected runtime identity.
   install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
   chown -R www-data:www-data /var/lib/sing-box
+  # Existing deployments commonly write access/error logs here. Convert the
+  # whole log tree so the new www-data runtime can continue using them.
+  if [[ -d /var/log/sing-box ]]; then
+    chown -R www-data:www-data /var/log/sing-box
+  fi
   install -d -o root -g www-data -m 0750 /etc/sing-box
   if [[ -f "$CONFIG" ]]; then
     chown root:www-data "$CONFIG"
