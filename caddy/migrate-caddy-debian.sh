@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# migrate-caddy-debian.sh
+#
+# One-time migration from the old/manual Caddy layout to the standard layout
+# installed by install-caddy-debian.sh.
+#
+# Expected old layout:
+#   binary:  /usr/local/bin/caddy
+#   unit:    /etc/systemd/system/caddy.service
+#   config:  /etc/caddy/caddy.jsonc
+#   storage: /home/tls
+#
+# The script deliberately keeps the old binary, unit backup and /home/tls so
+# rollback remains possible. It does not modify sing-box configuration.
+
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly INSTALLER="${SCRIPT_DIR}/install-caddy-debian.sh"
+
+readonly CONFIG="/etc/caddy/caddy.jsonc"
+readonly OLD_BINARY="/usr/local/bin/caddy"
+readonly OLD_UNIT="/etc/systemd/system/caddy.service"
+readonly OLD_STORAGE="/home/tls"
+readonly NEW_STORAGE="/var/lib/caddy/.local/share/caddy"
+
+readonly BACKUP_ROOT="/root/caddy-migration-backup"
+readonly BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
+
+log() { printf '\n==> %s\n' "$*"; }
+die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+preflight() {
+    [[ ${EUID} -eq 0 ]] || die "Run this script as root."
+    [[ -x "${INSTALLER}" ]] || die "Missing executable installer: ${INSTALLER}"
+    [[ -x "${OLD_BINARY}" ]] || die "Old Caddy binary not found: ${OLD_BINARY}"
+    [[ -f "${OLD_UNIT}" ]] || die "Old Caddy unit not found: ${OLD_UNIT}"
+    [[ -f "${CONFIG}" ]] || die "Caddy config not found: ${CONFIG}"
+    [[ -d "${OLD_STORAGE}" ]] || die "Old Caddy storage not found: ${OLD_STORAGE}"
+
+    getent passwd sing-box >/dev/null ||
+        die "User 'sing-box' does not exist. Install official sing-box first."
+
+    if dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q "install ok installed"; then
+        die "APT Caddy is already installed; refusing automatic migration."
+    fi
+
+    systemctl is-active --quiet caddy ||
+        die "Old caddy.service is not active; inspect the server before migrating."
+
+    grep -Fq '/home/tls' "${CONFIG}" ||
+        die "The config does not reference /home/tls; inspect it before migrating."
+}
+
+backup_old_installation() {
+    log "Backing up the old Caddy installation to ${BACKUP_DIR}"
+
+    install -d -m 0700 "${BACKUP_DIR}"
+    cp -a "${OLD_BINARY}" "${BACKUP_DIR}/caddy.old"
+    cp -a "${OLD_UNIT}" "${BACKUP_DIR}/caddy.service.old"
+    cp -a "${CONFIG}" "${BACKUP_DIR}/caddy.jsonc.old"
+
+    # The TLS tree can be large. Keep the original /home/tls in place as the
+    # primary rollback copy rather than duplicating it into /root.
+    {
+        printf 'Old storage retained in place: %s\n' "${OLD_STORAGE}"
+        printf 'Migration started: %s\n' "$(date --iso-8601=seconds)"
+    } >"${BACKUP_DIR}/README.txt"
+}
+
+prepare_for_installer() {
+    log "Stopping old Caddy and preserving the old systemd unit"
+
+    systemctl stop caddy
+
+    # The clean installer rejects /usr/local/bin/caddy and an already installed
+    # Caddy package. Keep the old binary in the timestamped backup and remove
+    # only the live path; /home/tls is intentionally untouched.
+    rm -f "${OLD_BINARY}"
+
+    # Move the old locally-created unit out of systemd's live search path.
+    # The official package can then install its vendor unit normally.
+    rm -f "${OLD_UNIT}"
+    systemctl daemon-reload
+}
+
+run_installer() {
+    log "Installing the new Caddy layout"
+    "${INSTALLER}"
+}
+
+migrate_storage_and_config() {
+    log "Migrating Caddy storage"
+
+    install -d -o sing-box -g sing-box -m 0700 "${NEW_STORAGE}"
+
+    # Copy, do not move: /home/tls remains an untouched rollback source.
+    cp -a "${OLD_STORAGE}/." "${NEW_STORAGE}/"
+    chown -R sing-box:sing-box /var/lib/caddy
+
+    # Rewrite only the known legacy storage root. Keep a post-install copy of
+    # the config before changing it.
+    cp -a "${CONFIG}" "${BACKUP_DIR}/caddy.jsonc.before-storage-rewrite"
+    sed -i 's#/home/tls/#/var/lib/caddy/.local/share/caddy/#g; s#/home/tls#/var/lib/caddy/.local/share/caddy#g' "${CONFIG}"
+
+    chown root:sing-box "${CONFIG}"
+    chmod 0640 "${CONFIG}"
+}
+
+validate_and_start() {
+    log "Validating migrated configuration"
+
+    runuser -u sing-box -- env HOME=/var/lib/caddy         /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
+
+    systemctl enable caddy
+    systemctl restart caddy
+
+    if ! systemctl is-active --quiet caddy; then
+        systemctl --no-pager --full status caddy || true
+        journalctl -u caddy -n 80 --no-pager || true
+        die "Migrated Caddy failed to start. Old files remain available in ${BACKUP_DIR} and ${OLD_STORAGE}."
+    fi
+
+    log "Migration completed"
+    printf 'Backup: %s\n' "${BACKUP_DIR}"
+    printf 'Old TLS storage retained: %s\n' "${OLD_STORAGE}"
+    printf 'New TLS storage: %s\n' "${NEW_STORAGE}"
+    printf '\nIMPORTANT: update sing-box certificate_path/key_path from /home/tls to the new Caddy storage before removing /home/tls.\n'
+}
+
+main() {
+    preflight
+    backup_old_installation
+    prepare_for_installer
+    run_installer
+    migrate_storage_and_config
+    validate_and_start
+}
+
+main "$@"
