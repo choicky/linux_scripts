@@ -45,6 +45,13 @@ on_error() {
         if [[ -f "${BACKUP_DIR}/caddy.old" && -f "${BACKUP_DIR}/caddy.service.old" ]]; then
             cp -a "${BACKUP_DIR}/caddy.old" "${OLD_BINARY}"
             cp -a "${BACKUP_DIR}/caddy.service.old" "${OLD_UNIT}"
+            cp -a "${BACKUP_DIR}/caddy.jsonc.old" "${CONFIG}"
+
+            # A drop-in created by the new installer would also modify the
+            # restored old unit, so remove only that migration-created drop-in.
+            rm -f /etc/systemd/system/caddy.service.d/override.conf
+            rmdir /etc/systemd/system/caddy.service.d 2>/dev/null || true
+
             systemctl daemon-reload
             if systemctl start caddy; then
                 printf 'Old Caddy service restored and started.\n' >&2
