@@ -74,7 +74,7 @@ install_caddy() {
     log "Installing Caddy Stable from the official APT repository"
 
     apt-get update
-    apt-get install -y debian-keyring debian-archive-keyring curl gpg
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
         gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
