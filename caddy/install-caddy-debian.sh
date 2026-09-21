@@ -7,7 +7,7 @@ readonly CONFIG="/etc/caddy/caddy.jsonc"
 readonly DROPIN_DIR="/etc/systemd/system/caddy.service.d"
 readonly DROPIN_FILE="${DROPIN_DIR}/override.conf"
 readonly CADDY_DEFAULT="/usr/bin/caddy.default"
-readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
+readonly CADDY_CUSTOM="/usr/bin/caddy.custom"\nreadonly CADDY_PACKAGE="/usr/bin/caddy.package"
 readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
@@ -44,9 +44,14 @@ install_caddy(){
   systemctl disable caddy >/dev/null 2>&1 || true
 }
 
+package_binary(){
+  if [[ -x "$CADDY_DEFAULT" ]]; then printf '%s\n' "$CADDY_DEFAULT"; else printf '%s\n' /usr/bin/caddy; fi
+}
+
 download_custom_caddy(){
-  local version asset tmpdir
-  version="$(/usr/bin/caddy version | awk '{print $1}')"
+  local version asset tmpdir package_bin
+  package_bin="$(package_binary)"
+  version="$("$package_bin" version | awk '{print $1}')"
   [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Cannot determine installed Caddy version."
   asset="caddy-linux-${ARCH}"
   tmpdir="$(mktemp -d)"
@@ -68,11 +73,17 @@ download_custom_caddy(){
 
 setup_custom_binary(){
   log "Registering stock and custom Caddy binaries"
-  if [[ ! -e "$CADDY_DEFAULT" ]]; then dpkg-divert --divert "$CADDY_DEFAULT" --rename /usr/bin/caddy; fi
+
+  # Keep the package-managed binary behind a dpkg diversion. Do not combine
+  # dpkg-divert with update-alternatives on /usr/bin/caddy: package upgrades
+  # must have one unambiguous destination for the stock binary.
+  if ! dpkg-divert --list /usr/bin/caddy | grep -Fq "$CADDY_DEFAULT"; then
+    dpkg-divert --add --rename --divert "$CADDY_DEFAULT" /usr/bin/caddy
+  fi
+
   [[ -x "$CADDY_DEFAULT" && -x "$CADDY_CUSTOM" ]] || die "Caddy binaries are incomplete."
-  update-alternatives --install /usr/bin/caddy caddy "$CADDY_DEFAULT" 10
-  update-alternatives --install /usr/bin/caddy caddy "$CADDY_CUSTOM" 50
-  update-alternatives --set caddy "$CADDY_CUSTOM"
+  ln -sfn "$CADDY_CUSTOM" /usr/bin/caddy
+  [[ "$(readlink -f /usr/bin/caddy)" == "$CADDY_CUSTOM" ]] || die "Custom Caddy is not selected."
 }
 
 setup_service(){
