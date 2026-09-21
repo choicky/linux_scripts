@@ -119,15 +119,18 @@ prepare_for_installer() {
     MIGRATION_STARTED=true
     OLD_CADDY_STOPPED=true
 
-    # The clean installer rejects /usr/local/bin/caddy and an already installed
-    # Caddy package. Keep the old binary in the timestamped backup and remove
-    # only the live path; /home/tls is intentionally untouched.
+    # Keep the old binary in the timestamped backup and remove only the live
+    # path; /home/tls is intentionally untouched.
     rm -f "${OLD_BINARY}"
 
     # Move the old locally-created unit out of systemd's live search path.
     # The official package can then install its vendor unit normally.
     rm -f "${OLD_UNIT}"
     systemctl daemon-reload
+
+    # Prevent the package vendor unit from starting /etc/caddy/Caddyfile if the
+    # host reboots before migration completes.
+    systemctl disable caddy >/dev/null 2>&1 || true
 }
 
 run_installer() {
@@ -163,7 +166,11 @@ validate_and_start() {
         /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
 
     systemctl enable caddy
-    systemctl restart caddy
+    if ! systemctl restart caddy; then
+        systemctl --no-pager --full status caddy || true
+        journalctl -u caddy -n 80 --no-pager || true
+        die "Migrated Caddy failed to start. Old files remain available in ${BACKUP_DIR} and ${OLD_STORAGE}."
+    fi
 
     if ! systemctl is-active --quiet caddy; then
         systemctl --no-pager --full status caddy || true
