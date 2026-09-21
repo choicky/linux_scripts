@@ -43,6 +43,8 @@ on_error() {
         # Keep any APT packages already installed. Restore only the old manual
         # binary and unit that this migration moved out of the live paths.
         if [[ -f "${BACKUP_DIR}/caddy.old" && -f "${BACKUP_DIR}/caddy.service.old" ]]; then
+            systemctl unmask caddy >/dev/null 2>&1 || true
+            rm -f "${OLD_UNIT}"
             cp -a "${BACKUP_DIR}/caddy.old" "${OLD_BINARY}"
             cp -a "${BACKUP_DIR}/caddy.service.old" "${OLD_UNIT}"
             cp -a "${BACKUP_DIR}/caddy.jsonc.old" "${CONFIG}"
@@ -128,8 +130,8 @@ prepare_for_installer() {
     rm -f "${OLD_UNIT}"
     systemctl daemon-reload
 
-    # Prevent the package vendor unit from starting /etc/caddy/Caddyfile if the
-    # host reboots before migration completes.
+    # The installer masks caddy before touching the package. This disable is an
+    # additional reboot safeguard until the new service is ready.
     systemctl disable caddy >/dev/null 2>&1 || true
 }
 
@@ -165,6 +167,7 @@ validate_and_start() {
     runuser -u sing-box -- env HOME=/var/lib/caddy \
         /usr/bin/caddy validate --config "${CONFIG}" --adapter jsonc
 
+    systemctl unmask caddy >/dev/null
     systemctl enable caddy
     if ! systemctl restart caddy; then
         systemctl --no-pager --full status caddy || true
