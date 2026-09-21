@@ -93,6 +93,22 @@ run_case(){
     listeners(){ printf 'tcp:443\n'; }
     health(){ [[ $ACTIVE == active ]]; }
     case "$name" in
+      migration_guard|migration_acl_error)
+        certificate_check(){
+          echo "certificate-check $1" >"$ROOT/gate.log"
+          if [[ $name == migration_guard ]]; then return 1; else return 2; fi
+        }
+        preflight(){ echo 'unexpected-preflight' >"$ROOT/mutated"; return 1; }
+        trap 'finish >"$ROOT/finish.log" 2>&1' EXIT
+        setup_cmd migrate
+        ;;
+      readonly_paths|readonly_acl)
+        require_root(){ :; }
+        init(){ echo 'unexpected-init' >"$ROOT/mutated"; return 1; }
+        certificate_check(){ echo "$1" >"$ROOT/readonly.log"; }
+        if [[ $name == readonly_paths ]]; then main check-cert-paths; else main check-cert-access; fi
+        [[ ! -e $ROOT/mutated ]]
+        ;;
       upgrade_*)
         rm -f "$ROOT/etc/systemd/system/caddy.service"
         printf '#!/bin/sh\n# old custom\nexit 0\n' >"$CUSTOM_BIN"
@@ -143,6 +159,8 @@ run_case(){
           trap 'finish >"$ROOT/finish.log" 2>&1' EXIT
           false
         fi
+        # Recovery must never depend on the sing-box path/ACL preflight gate.
+        certificate_check(){ die 'Unexpected certificate gate during rollback.'; }
         restore_backup "$BACKUP"
         TRANSACTION=0
         grep -q 'old config' "$CONFIG"
@@ -219,4 +237,22 @@ for name in upgrade_build upgrade_validate upgrade_atomic upgrade_restart upgrad
     grep -q 'restored and verified' "$SANDBOX/$name/finish.log"
   fi
   echo "PASS: $name keeps/restores old binary"
+done
+
+for name in migration_guard migration_acl_error; do
+  set +e
+  run_case "$name" >"$SANDBOX/$name.log" 2>&1
+  rc=$?
+  set -e
+  [[ $rc != 0 ]]
+  [[ ! -e $SANDBOX/$name/mutated && ! -e $SANDBOX/$name/systemctl.log ]]
+  [[ -z $(find "$SANDBOX/$name/var/backups/caddy-manager" -mindepth 1 -print -quit) ]]
+  grep -q 'old config' "$SANDBOX/$name/etc/caddy/caddy.jsonc"
+  grep -q 'old private data' "$SANDBOX/$name/home/tls/fixture"
+  grep -q 'legacy unit' "$SANDBOX/$name/etc/systemd/system/caddy.service"
+  echo "PASS: $name aborts before validation/backup/service/storage changes"
+done
+for name in readonly_paths readonly_acl; do
+  run_case "$name"
+  echo "PASS: $name bypasses all mutating initialization"
 done

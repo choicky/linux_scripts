@@ -12,6 +12,8 @@ readonly -a SNAPSHOT_PATHS=(usr/local/bin/caddy usr/bin/caddy.custom etc/caddy
   run/systemd/system/caddy.service run/systemd/system/caddy.service.d
   etc/systemd/system/multi-user.target.wants/caddy.service
   home/tls var/lib/caddy)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
 WORK='' BACKUP='' TRANSACTION=0 POLICY=0 ATOMIC=''
 log(){ printf '[INFO] %s\n' "$*"; }
 warn(){ printf '[WARN] %s\n' "$*" >&2; }
@@ -388,8 +390,16 @@ upgrade_cmd(){
   health "$WORK/ports" "$CUSTOM_BIN"
   commit_transaction
 }
+certificate_check(){
+  local check=$1
+  command -v python3 >/dev/null || die 'Certificate audit requires python3; no changes made.'
+  [[ -r $SCRIPT_DIR/certificate-check.py ]] || die 'Keep certificate-check.py next to manage-caddy.sh.'
+  python3 -B "$SCRIPT_DIR/certificate-check.py" "$check"
+}
 setup_cmd(){
   local mode=$1 source=${CADDY_CUSTOM_BINARY:-} p
+  # Must precede validation (which can provision storage), backup, stop and APT.
+  certificate_check migration
   preflight
   if [[ $mode == install ]]; then
     [[ ! -f /etc/systemd/system/caddy.service && ! -x /usr/local/bin/caddy ]] || die 'Legacy installation detected; use migrate.'
@@ -432,7 +442,7 @@ setup_cmd(){
   systemctl restart caddy.service
   health "$WORK/ports" "$CUSTOM_BIN"
   commit_transaction
-  log "Keep $LEGACY_DATA until manual post-migration verification."
+  log "Keep $LEGACY_DATA only for old data/rollback; it is not a renewed certificate source."
 }
 rollback_cmd(){
   local d=${1:-}
@@ -469,11 +479,16 @@ check_cmd(){
   log 'Caddy checks passed.'
 }
 usage(){
-  printf '%s\n' "Usage: $0 {install|migrate|upgrade|rollback [BACKUP_DIR]|check|status}" \
+  printf '%s\n' "Usage: $0 {install|migrate|upgrade|rollback [BACKUP_DIR]|check|status|check-cert-paths|check-cert-access}" \
     'Fresh install: sudo env CADDY_CUSTOM_BINARY=/path/caddy CADDY_REQUIRED_PORTS="tcp:80 tcp:443" bash caddy/manage-caddy.sh install' \
     'Upgrade prerequisites: current Go, xcaddy, curl; no experimental caddy upgrade is used.'
 }
 main(){
+  # These commands are genuinely read-only: no lock, backup directory, tmp or systemd.
+  case ${1:-} in
+    check-cert-paths) require_root; certificate_check paths; return ;;
+    check-cert-access) require_root; certificate_check access; return ;;
+  esac
   case ${1:-} in install|migrate|upgrade|rollback|check|status) ;; *) usage; return 2;; esac
   [[ ${CADDY_BACKUP_KEEP:-5} =~ ^[1-9][0-9]*$ ]] || die 'CADDY_BACKUP_KEEP must be a positive integer.'
   init
