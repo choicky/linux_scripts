@@ -30,9 +30,16 @@ readonly BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
 
 MIGRATION_STARTED=false
 OLD_CADDY_STOPPED=false
+OLD_CADDY_ENABLED=false
 
 log() { printf '\n==> %s\n' "$*"; }
-die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+die() {
+    printf '\nERROR: %s\n' "$*" >&2
+    if [[ "${MIGRATION_STARTED}" == true && "${OLD_CADDY_STOPPED}" == true ]]; then
+        on_error 1
+    fi
+    exit 1
+}
 
 on_error() {
     local exit_code="${1:-$?}"
@@ -55,6 +62,11 @@ on_error() {
             rmdir /etc/systemd/system/caddy.service.d 2>/dev/null || true
 
             systemctl daemon-reload
+            if [[ "${OLD_CADDY_ENABLED}" == true ]]; then
+                systemctl enable caddy >/dev/null 2>&1 || true
+            else
+                systemctl disable caddy >/dev/null 2>&1 || true
+            fi
             if systemctl start caddy; then
                 printf 'Old Caddy service restored and started.\n' >&2
             else
@@ -85,6 +97,10 @@ preflight() {
 
     systemctl is-active --quiet caddy ||
         die "Old caddy.service is not active; inspect the server before migrating."
+
+    if systemctl is-enabled --quiet caddy; then
+        OLD_CADDY_ENABLED=true
+    fi
 
     # All of these VPSes use the same Caddy FileStorage layout, although their
     # domain names differ. Require the legacy root to be configured explicitly
