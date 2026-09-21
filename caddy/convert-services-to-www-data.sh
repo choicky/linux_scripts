@@ -47,6 +47,9 @@ chmod 0640 "$CADDY_CONFIG"
 
 install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
 chown -R www-data:www-data /var/lib/sing-box
+if [[ -d /var/log/sing-box ]]; then
+  chown -R www-data:www-data /var/log/sing-box
+fi
 chown root:www-data /etc/sing-box "$SINGBOX_CONFIG"
 chmod 0750 /etc/sing-box
 chmod 0640 "$SINGBOX_CONFIG"
@@ -61,7 +64,12 @@ log "Starting services"
 systemctl restart caddy
 systemctl restart sing-box
 systemctl is-active --quiet caddy || die "Caddy is not active."
-systemctl is-active --quiet sing-box || die "sing-box is not active."
+sleep 1
+[[ "$(systemctl is-active sing-box)" == active ]] || {
+  systemctl --no-pager --full status sing-box || true
+  journalctl -u sing-box -n 30 --no-pager || true
+  die "sing-box is not active."
+}
 
 log "Current runtime identities"
 systemctl show caddy -p User -p Group
