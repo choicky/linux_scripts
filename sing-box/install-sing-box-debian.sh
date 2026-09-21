@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install sing-box Stable from the official APT repository on Debian 12/13.
+# Install the stable sing-box package from the official APT repository on Debian 12/13.
+# This script deliberately installs "sing-box", never "sing-box-beta".
 # Keep the vendor systemd unit and override only the runtime user/group.
 set -Eeuo pipefail
 
@@ -57,6 +58,10 @@ EOF
 
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box
+  dpkg-query -W -f='${Status}\n' sing-box 2>/dev/null | grep -Fxq 'install ok installed' || die "Stable sing-box package was not installed."
+  if dpkg-query -W -f='${Status}\n' sing-box-beta 2>/dev/null | grep -Fxq 'install ok installed'; then
+    die "sing-box-beta is installed. Remove it before using this stable-package installer."
+  fi
   systemctl stop sing-box >/dev/null 2>&1 || true
 }
 
