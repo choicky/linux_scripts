@@ -165,7 +165,7 @@ ssh_effective_value() {
   sshd -T | awk -v wanted="$key" '$1 == wanted { print $2; exit }'
 }
 
-assert_ssh_hardened() {
+check_ssh_hardened() {
   local root_login password_auth kbd_auth pubkey_auth max_auth
   root_login="$(ssh_effective_value permitrootlogin)"
   password_auth="$(ssh_effective_value passwordauthentication)"
@@ -173,11 +173,11 @@ assert_ssh_hardened() {
   pubkey_auth="$(ssh_effective_value pubkeyauthentication)"
   max_auth="$(ssh_effective_value maxauthtries)"
 
-  [[ "$root_login" == "no" ]] || die "Effective PermitRootLogin is '$root_login', expected 'no'."
-  [[ "$password_auth" == "yes" ]] || die "Effective PasswordAuthentication is '$password_auth', expected 'yes'."
-  [[ "$kbd_auth" == "no" ]] || die "Effective KbdInteractiveAuthentication is '$kbd_auth', expected 'no'."
-  [[ "$pubkey_auth" == "yes" ]] || die "Effective PubkeyAuthentication is '$pubkey_auth', expected 'yes'."
-  [[ "$max_auth" == "4" ]] || die "Effective MaxAuthTries is '$max_auth', expected '4'."
+  [[ "$root_login" == "no" ]] || { echo "Effective PermitRootLogin is '$root_login', expected 'no'." >&2; return 1; }
+  [[ "$password_auth" == "yes" ]] || { echo "Effective PasswordAuthentication is '$password_auth', expected 'yes'." >&2; return 1; }
+  [[ "$kbd_auth" == "no" ]] || { echo "Effective KbdInteractiveAuthentication is '$kbd_auth', expected 'no'." >&2; return 1; }
+  [[ "$pubkey_auth" == "yes" ]] || { echo "Effective PubkeyAuthentication is '$pubkey_auth', expected 'yes'." >&2; return 1; }
+  [[ "$max_auth" == "4" ]] || { echo "Effective MaxAuthTries is '$max_auth', expected '4'." >&2; return 1; }
   ok "Effective SSH configuration matches the intended policy."
 }
 
@@ -219,7 +219,7 @@ harden() {
 
   log "Preparing SSH hardening drop-in"
   install -d -m 0755 /etc/ssh/sshd_config.d
-  local cfg=/etc/ssh/sshd_config.d/90-vps-baseline.conf
+  local cfg=/etc/ssh/sshd_config.d/00-vps-baseline.conf
   local tmp backup=""
   tmp="$(mktemp)"
   cat >"$tmp" <<'EOF'
@@ -251,14 +251,14 @@ EOF
   fi
 
   # Verify the merged/effective configuration BEFORE touching the running daemon.
-  if ! assert_ssh_hardened; then
+  if ! check_ssh_hardened; then
     [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"
     die "Effective SSH policy did not match expectations; previous drop-in state restored."
   fi
 
   systemctl reload ssh
   systemctl is-active --quiet ssh || die "SSH service is not active after reload."
-  assert_ssh_hardened
+  check_ssh_hardened
 
   log "Effective SSH settings"
   sshd -T | grep -Ei 'permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries'
