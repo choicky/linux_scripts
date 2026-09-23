@@ -144,6 +144,7 @@ EOF
     skipped "$cfg already has the desired configuration."
   else
     install -m 0644 "$tmp" "$cfg"
+    cfg_changed=1
     changed "Installed $cfg."
   fi
   rm -f "$tmp"
@@ -220,7 +221,7 @@ harden() {
   log "Preparing SSH hardening drop-in"
   install -d -m 0755 /etc/ssh/sshd_config.d
   local cfg=/etc/ssh/sshd_config.d/00-vps-baseline.conf
-  local tmp backup=""
+  local tmp backup="" cfg_changed=0
   tmp="$(mktemp)"
   cat >"$tmp" <<'EOF'
 # Managed by linux_scripts/system/init-debian-server.sh
@@ -246,19 +247,19 @@ EOF
   fi
 
   if ! sshd -t; then
-    [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"
-    die "sshd syntax validation failed; previous drop-in state restored."
+    if (( cfg_changed )); then [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"; fi
+    die "sshd syntax validation failed; previous drop-in state restored when changed."
   fi
 
   # Verify the merged/effective configuration BEFORE touching the running daemon.
   if ! check_ssh_hardened; then
-    [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"
-    die "Effective SSH policy did not match expectations; previous drop-in state restored."
+    if (( cfg_changed )); then [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"; fi
+    die "Effective SSH policy did not match expectations; previous drop-in state restored when changed."
   fi
 
   systemctl reload ssh
   systemctl is-active --quiet ssh || die "SSH service is not active after reload."
-  check_ssh_hardened
+  check_ssh_hardened || die "Effective SSH policy changed unexpectedly after reload."
 
   log "Effective SSH settings"
   sshd -T | grep -Ei 'permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries'
