@@ -21,6 +21,35 @@ Personal Linux server administration and deployment scripts.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
 - `sing-box/migrate-caddy-cert-paths.sh` — migrate sing-box certificate/key paths from legacy Caddy storage to the standard Caddy storage.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
+- `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
+
+## System tools
+
+Run the hostname helper as root on Debian 12/13:
+
+```bash
+bash system/set-hostname.sh AliSZ
+bash system/set-hostname.sh AliHK
+bash system/set-hostname.sh OracleKR3
+```
+
+Supply exactly one hostname (or `-h`/`--help`). Names must contain 1–63 ASCII
+letters, digits or hyphens, with no leading/trailing hyphen. Spaces, dots and
+underscores are rejected. Input case is preserved; an identical static hostname
+is a no-op.
+
+The script reads `hostnamectl --static` and creates a timestamped
+`/etc/hosts.before-hostname-*` backup before changing anything. It replaces only
+complete hostname fields equal to the old name, preserving comments, spacing,
+unrelated records, owner and permissions. If no field matches, hosts stays
+unchanged; no records are added. The script requires a regular, non-symlink
+hosts file and uses an atomic replacement before calling
+`hostnamectl set-hostname`. On failure or a handled interruption, it attempts
+to restore changed hosts/hostname state and reports any recovery failure.
+
+On success it displays the static hostname, `/etc/hostname`, and hosts entries
+for localhost and the new name. A VPS reboot is usually unnecessary; reconnect
+via SSH to see the updated shell prompt.
 
 ## Standard runtime layout
 
