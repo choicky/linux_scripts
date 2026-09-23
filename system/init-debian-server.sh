@@ -144,7 +144,6 @@ EOF
     skipped "$cfg already has the desired configuration."
   else
     install -m 0644 "$tmp" "$cfg"
-    cfg_changed=1
     changed "Installed $cfg."
   fi
   rm -f "$tmp"
@@ -243,6 +242,7 @@ EOF
     fi
     install -m 0644 "$tmp" "$cfg"
     rm -f "$tmp"
+    cfg_changed=1
     changed "Installed $cfg."
   fi
 
