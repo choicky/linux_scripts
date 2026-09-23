@@ -10,7 +10,7 @@ usage() {
 Usage:
   sudo bash system/init-debian-server.sh prepare --user USER [--swap-gib N] [--timezone ZONE]
   sudo bash system/init-debian-server.sh harden  --user USER
-  sudo bash system/init-debian-server.sh status --user USER
+  sudo bash system/init-debian-server.sh status  --user USER
 
 Defaults:
   --swap-gib 2
@@ -22,13 +22,16 @@ Workflow:
   3. Keep that verified session open and run "harden".
   4. Open another new terminal and verify USER can still log in.
 
-The script intentionally keeps SSH password authentication enabled and disables
-direct root SSH login only in the explicit "harden" phase.
+Password authentication intentionally remains enabled. Direct root SSH login is
+disabled only in the explicit "harden" phase.
 EOF
 }
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+die() { echo "FAILED: $*" >&2; exit 1; }
 log() { printf '\n==> %s\n' "$*"; }
+ok() { echo "OK: $*"; }
+changed() { echo "CHANGED: $*"; }
+skipped() { echo "SKIPPED: $*"; }
 
 [[ $EUID -eq 0 ]] || die "Run this script as root (or via sudo)."
 
@@ -61,42 +64,73 @@ case "${VERSION_ID:-}" in 12|13) ;; *) die "Supported Debian versions are 12 and
 
 ensure_admin_user() {
   if id "$ADMIN_USER" >/dev/null 2>&1; then
-    log "Administrative user '$ADMIN_USER' already exists"
+    skipped "Administrative user '$ADMIN_USER' already exists."
   else
     log "Creating administrative user '$ADMIN_USER'"
     adduser "$ADMIN_USER"
+    changed "Created user '$ADMIN_USER'."
   fi
-  usermod -aG sudo "$ADMIN_USER"
+
+  if id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then
+    skipped "User '$ADMIN_USER' is already in sudo group."
+  else
+    usermod -aG sudo "$ADMIN_USER"
+    changed "Added '$ADMIN_USER' to sudo group."
+  fi
 }
 
 verify_admin_user() {
   id "$ADMIN_USER" >/dev/null 2>&1 || die "User '$ADMIN_USER' does not exist."
   id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo || die "User '$ADMIN_USER' is not in sudo group."
-  local status
-  status="$(passwd -S "$ADMIN_USER" | awk '{print $2}')"
-  [[ "$status" == "P" ]] || die "User '$ADMIN_USER' does not have an active password (passwd status: $status)."
+  local password_status
+  password_status="$(passwd -S "$ADMIN_USER" | awk '{print $2}')"
+  [[ "$password_status" == "P" ]] || die "User '$ADMIN_USER' does not have an active password (passwd status: $password_status)."
+  ok "Administrative user '$ADMIN_USER' exists, has sudo membership, and has an active password."
 }
 
 setup_swap() {
-  (( SWAP_GIB > 0 )) || { log "Swap creation disabled (--swap-gib 0)"; return; }
+  (( SWAP_GIB > 0 )) || { skipped "Swap creation disabled (--swap-gib 0)."; return; }
+
   if swapon --noheadings --show=NAME | grep -q .; then
-    log "Swap already exists; leaving it unchanged"
+    skipped "Active swap already exists; leaving it unchanged."
     swapon --show
     return
   fi
+
   [[ ! -e /swapfile ]] || die "/swapfile exists but is not active; inspect it manually."
+
+  local required_bytes available_bytes margin_bytes
+  required_bytes=$((SWAP_GIB * 1024 * 1024 * 1024))
+  margin_bytes=$((1024 * 1024 * 1024))
+  available_bytes="$(df --output=avail -B1 / | tail -n1 | tr -d ' ')"
+  [[ "$available_bytes" =~ ^[0-9]+$ ]] || die "Could not determine available disk space."
+  (( available_bytes >= required_bytes + margin_bytes )) ||
+    die "Not enough free disk space for ${SWAP_GIB} GiB swap plus 1 GiB safety margin."
+
   log "Creating ${SWAP_GIB} GiB swapfile"
-  fallocate -l "${SWAP_GIB}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$((SWAP_GIB * 1024))" status=progress
+  if ! fallocate -l "${SWAP_GIB}G" /swapfile; then
+    rm -f /swapfile
+    dd if=/dev/zero of=/swapfile bs=1M count="$((SWAP_GIB * 1024))" status=progress
+  fi
   chmod 600 /swapfile
   mkswap /swapfile
   swapon /swapfile
-  grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  if grep -qE '^/swapfile[[:space:]]' /etc/fstab; then
+    skipped "/etc/fstab already contains /swapfile."
+  else
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    changed "Added /swapfile to /etc/fstab."
+  fi
+  changed "Enabled ${SWAP_GIB} GiB swapfile."
 }
 
 configure_fail2ban() {
   log "Configuring fail2ban for SSH"
-  install -d -m 0755 /etc/fail2ban/jail.d
-  cat >/etc/fail2ban/jail.d/sshd.local <<'EOF'
+  local cfg=/etc/fail2ban/jail.d/sshd.local
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
 [sshd]
 enabled = true
 backend = systemd
@@ -104,16 +138,61 @@ maxretry = 5
 findtime = 10m
 bantime = 1h
 EOF
-  systemctl enable --now fail2ban
+
+  install -d -m 0755 /etc/fail2ban/jail.d
+  if [[ -f "$cfg" ]] && cmp -s "$tmp" "$cfg"; then
+    skipped "$cfg already has the desired configuration."
+  else
+    install -m 0644 "$tmp" "$cfg"
+    changed "Installed $cfg."
+  fi
+  rm -f "$tmp"
+
+  systemctl enable fail2ban >/dev/null
+  if systemctl is-active --quiet fail2ban; then
+    systemctl restart fail2ban
+  else
+    systemctl start fail2ban
+  fi
+
+  fail2ban-client ping | grep -q 'Server replied: pong' || die "fail2ban daemon did not respond to ping."
+  fail2ban-client status sshd >/dev/null || die "fail2ban sshd jail is not active."
+  ok "fail2ban daemon and sshd jail are active."
+}
+
+ssh_effective_value() {
+  local key="$1"
+  sshd -T | awk -v wanted="$key" '$1 == wanted { print $2; exit }'
+}
+
+assert_ssh_hardened() {
+  local root_login password_auth kbd_auth pubkey_auth max_auth
+  root_login="$(ssh_effective_value permitrootlogin)"
+  password_auth="$(ssh_effective_value passwordauthentication)"
+  kbd_auth="$(ssh_effective_value kbdinteractiveauthentication)"
+  pubkey_auth="$(ssh_effective_value pubkeyauthentication)"
+  max_auth="$(ssh_effective_value maxauthtries)"
+
+  [[ "$root_login" == "no" ]] || die "Effective PermitRootLogin is '$root_login', expected 'no'."
+  [[ "$password_auth" == "yes" ]] || die "Effective PasswordAuthentication is '$password_auth', expected 'yes'."
+  [[ "$kbd_auth" == "no" ]] || die "Effective KbdInteractiveAuthentication is '$kbd_auth', expected 'no'."
+  [[ "$pubkey_auth" == "yes" ]] || die "Effective PubkeyAuthentication is '$pubkey_auth', expected 'yes'."
+  [[ "$max_auth" == "4" ]] || die "Effective MaxAuthTries is '$max_auth', expected '4'."
+  ok "Effective SSH configuration matches the intended policy."
 }
 
 prepare() {
-  log "Updating APT metadata and installing baseline packages"
+  log "Updating APT metadata and ensuring baseline packages are installed"
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y     sudo fail2ban ca-certificates curl git rsync vim-tiny
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    sudo fail2ban ca-certificates curl git rsync vim-tiny
 
-  log "Setting timezone to $TIMEZONE"
-  timedatectl set-timezone "$TIMEZONE"
+  if [[ "$(timedatectl show -p Timezone --value)" == "$TIMEZONE" ]]; then
+    skipped "Timezone is already $TIMEZONE."
+  else
+    timedatectl set-timezone "$TIMEZONE"
+    changed "Timezone set to $TIMEZONE."
+  fi
 
   ensure_admin_user
   verify_admin_user
@@ -136,14 +215,13 @@ EOF
 
 harden() {
   verify_admin_user
-
   command -v sshd >/dev/null 2>&1 || die "sshd not found."
-  log "Writing SSH hardening drop-in"
+
+  log "Preparing SSH hardening drop-in"
   install -d -m 0755 /etc/ssh/sshd_config.d
   local cfg=/etc/ssh/sshd_config.d/90-vps-baseline.conf
-  local tmp
+  local tmp backup=""
   tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' EXIT
   cat >"$tmp" <<'EOF'
 # Managed by linux_scripts/system/init-debian-server.sh
 # Password login remains enabled by design; direct root SSH login is disabled.
@@ -153,14 +231,35 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 MaxAuthTries 4
 EOF
-  install -m 0644 "$tmp" "$cfg"
+
+  if [[ -f "$cfg" ]] && cmp -s "$tmp" "$cfg"; then
+    skipped "$cfg already has the desired content."
+    rm -f "$tmp"
+  else
+    if [[ -f "$cfg" ]]; then
+      backup="${cfg}.before-init-$(date +%Y%m%d%H%M%S)"
+      cp -a "$cfg" "$backup"
+    fi
+    install -m 0644 "$tmp" "$cfg"
+    rm -f "$tmp"
+    changed "Installed $cfg."
+  fi
 
   if ! sshd -t; then
-    rm -f "$cfg"
-    die "sshd validation failed; the new drop-in was removed."
+    [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"
+    die "sshd syntax validation failed; previous drop-in state restored."
+  fi
+
+  # Verify the merged/effective configuration BEFORE touching the running daemon.
+  if ! assert_ssh_hardened; then
+    [[ -n "$backup" ]] && cp -a "$backup" "$cfg" || rm -f "$cfg"
+    die "Effective SSH policy did not match expectations; previous drop-in state restored."
   fi
 
   systemctl reload ssh
+  systemctl is-active --quiet ssh || die "SSH service is not active after reload."
+  assert_ssh_hardened
+
   log "Effective SSH settings"
   sshd -T | grep -Ei 'permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries'
 
@@ -187,6 +286,7 @@ status() {
   sshd -T 2>/dev/null | grep -Ei 'permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries' || true
   echo "=== FAIL2BAN ==="
   systemctl is-active fail2ban 2>/dev/null || true
+  fail2ban-client ping 2>/dev/null || true
   fail2ban-client status sshd 2>/dev/null || true
   echo "=== LISTENERS ==="
   ss -lntup
