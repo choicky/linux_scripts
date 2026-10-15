@@ -164,6 +164,22 @@ bash sing-box/install-sing-box-debian.sh
 
 Place/verify the real Caddy and sing-box configurations before allowing the services to start. Both installers support `--no-start` when configuration needs to be prepared first.
 
+After a successful **Caddy** installation with no JSONC configuration, or with
+`--no-start`, its service is **stopped, disabled and unmasked**. The custom binary
+and `www-data` drop-in are ready, so configuration deployment can inspect the unit,
+validate the candidate and restart it without a manual unmask step. Once the first
+configuration is deployed successfully, enable boot startup with
+`systemctl enable caddy`. With an existing valid configuration and no
+`--no-start`, the installer enables and starts Caddy normally.
+
+The temporary installation mask still prevents the package from starting its stock
+Caddyfile. An incomplete binary/unit installation remains stopped and masked on
+failure; fix the cause and rerun the installer. Once runtime setup is complete,
+failures leave Caddy stopped/disabled and remove only the mask introduced by that
+attempt; a pre-existing mask is retained on failure. This is a safe stopped state,
+not a rollback of package/binary changes. The separate sing-box installer's masked
+state and recovery behavior are documented below.
+
 Do not use the migration procedure below for a clean server.
 
 ### sing-box installation and recovery

@@ -13,7 +13,29 @@ readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
 NO_START=false
 BUILD_DIR=""
-cleanup(){ [[ -z "$BUILD_DIR" ]] || rm -rf "$BUILD_DIR"; }
+SERVICE_TOUCHED=false
+RUNTIME_READY=false
+WAS_MASKED=false
+cleanup(){
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )) && [[ "$SERVICE_TOUCHED" == true ]]; then
+    systemctl stop caddy >/dev/null 2>&1 || true
+    systemctl disable caddy >/dev/null 2>&1 || true
+    # Only expose the unit again when its custom binary/drop-in/paths are ready.
+    # Preserve a mask that predated this attempt on failure.
+    if [[ "$RUNTIME_READY" == true && "$WAS_MASKED" == false ]]; then
+      systemctl unmask caddy >/dev/null 2>&1 || true
+      systemctl daemon-reload || true
+      printf '\nInstallation failed; Caddy is stopped and disabled. Fix the error and rerun.\n' >&2
+    else
+      systemctl mask caddy >/dev/null 2>&1 || true
+      printf '\nInstallation failed; Caddy remains stopped and masked. Complete installation before deployment.\n' >&2
+    fi
+  fi
+  [[ -z "$BUILD_DIR" ]] || rm -rf "$BUILD_DIR"
+  exit "$rc"
+}
 trap cleanup EXIT
 
 log(){ printf '\n==> %s\n' "$*"; }
@@ -31,6 +53,9 @@ preflight(){
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
   [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture: $(dpkg --print-architecture). Only amd64 and arm64 are provided.";; esac
+  case "$(systemctl is-enabled caddy 2>/dev/null || true)" in
+    masked|masked-runtime) WAS_MASKED=true;;
+  esac
   log "Environment: Debian ${VERSION_ID}, architecture: ${ARCH}"
 }
 
@@ -53,7 +78,10 @@ install_caddy(){
 install_caddy_package(){
   # Downloads, checksum, version and module checks have all passed by now.
   log "Installing verified Caddy package ${PACKAGE_VERSION}"
-  systemctl stop caddy >/dev/null 2>&1 || true
+  if ! systemctl stop caddy; then
+    [[ "$(systemctl show caddy -p LoadState --value)" == not-found ]] || die "Cannot stop existing Caddy."
+  fi
+  SERVICE_TOUCHED=true
   systemctl mask caddy >/dev/null
   DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
   systemctl stop caddy
@@ -131,17 +159,30 @@ validate_installation(){
   log "Validating installed Caddy"
   /usr/bin/caddy version
   [[ "$NO_START" == true ]] && { log "Configuration validation skipped by --no-start."; return; }
-  [[ -f "$CONFIG" ]] && runuser -u www-data -- env HOME=/var/lib/caddy /usr/bin/caddy validate --config "$CONFIG" --adapter jsonc
+  if [[ -f "$CONFIG" ]]; then
+    runuser -u www-data -- env HOME=/var/lib/caddy /usr/bin/caddy validate --config "$CONFIG" --adapter jsonc
+  else
+    log "$CONFIG is absent; no configuration to validate yet."
+  fi
+  return 0
 }
 
 start_caddy(){
-  [[ "$NO_START" == true ]] && { log "Caddy installed; service remains masked and start is skipped by --no-start."; return; }
-  [[ -f "$CONFIG" ]] || { log "Caddy is installed but remains masked because $CONFIG is absent."; return; }
+  # Successful installation must expose the www-data unit to deployment tools.
+  # Disabled/stopped is enough to prevent boot startup; a mask hides User/ExecStart.
   systemctl unmask caddy >/dev/null
+  systemctl daemon-reload
+  if [[ "$NO_START" == true || ! -f "$CONFIG" ]]; then
+    systemctl stop caddy
+    systemctl disable caddy >/dev/null 2>&1
+    log "Caddy installed: stopped, disabled and unmasked; configuration can now be deployed."
+    systemctl show caddy -p User -p Group -p ExecStart --no-pager
+    return 0
+  fi
   systemctl enable caddy
   if ! systemctl restart caddy; then systemctl --no-pager --full status caddy || true; journalctl -u caddy -n 50 --no-pager || true; die "Caddy failed to start."; fi
   systemctl is-active --quiet caddy || die "Caddy is not active."
 }
 
-main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; setup_service; prepare_paths; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
+main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; setup_service; prepare_paths; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
 main "$@"
