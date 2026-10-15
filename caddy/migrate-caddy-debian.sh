@@ -50,6 +50,8 @@ die() {
 
 on_error() {
     local exit_code="${1:-$?}"
+    trap - ERR
+    set +e
 
     if [[ "${MIGRATION_STARTED}" == true && "${OLD_CADDY_STOPPED}" == true ]]; then
         printf '\nERROR: Caddy migration stopped before completion. Restoring the old Caddy service...\n' >&2
@@ -57,6 +59,7 @@ on_error() {
         # Keep any APT packages already installed. Restore only the old manual
         # binary and unit that this migration moved out of the live paths.
         if [[ -f "${BACKUP_DIR}/caddy.old" && -f "${BACKUP_DIR}/caddy.service.old" ]]; then
+            systemctl stop caddy >/dev/null 2>&1 || true
             systemctl unmask caddy >/dev/null 2>&1 || true
             rm -f "${OLD_UNIT}"
             cp -a "${BACKUP_DIR}/caddy.old" "${OLD_BINARY}"
@@ -66,6 +69,9 @@ on_error() {
             # A drop-in created by the new installer would also modify the
             # restored old unit, so remove only that migration-created drop-in.
             rm -f /etc/systemd/system/caddy.service.d/override.conf
+            if [[ -d "${BACKUP_DIR}/dropins.old" ]]; then
+                cp -a "${BACKUP_DIR}/dropins.old/." /etc/systemd/system/caddy.service.d/
+            fi
             rmdir /etc/systemd/system/caddy.service.d 2>/dev/null || true
 
             chown "${OLD_ETC_CADDY_OWNER}" /etc/caddy
@@ -147,6 +153,9 @@ backup_old_installation() {
     cp -a "${OLD_BINARY}" "${BACKUP_DIR}/caddy.old"
     cp -a "${OLD_UNIT}" "${BACKUP_DIR}/caddy.service.old"
     cp -a "${CONFIG}" "${BACKUP_DIR}/caddy.jsonc.old"
+    if [[ -d /etc/systemd/system/caddy.service.d ]]; then
+        cp -a /etc/systemd/system/caddy.service.d "${BACKUP_DIR}/dropins.old"
+    fi
 
     # The TLS tree can be large. Keep the original /home/tls in place as the
     # primary rollback copy rather than duplicating it into /root.
@@ -230,7 +239,7 @@ validate_and_start() {
 }
 
 check_sing_box_references() {
-    [[ -d /etc/sing-box ]] || return
+    [[ -d /etc/sing-box ]] || return 0
 
     log "Checking sing-box for legacy /home/tls references"
 
@@ -254,9 +263,9 @@ main() {
     run_installer
     migrate_storage_and_config
     validate_and_start
-    check_sing_box_references
     OLD_CADDY_STOPPED=false
     MIGRATION_STARTED=false
+    check_sing_box_references
 }
 
 main "$@"

@@ -11,17 +11,17 @@ readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
 
-TMPDIR=""
+BUILD_DIR=""
 BACKUP_CUSTOM=""
 SERVICE_WAS_ACTIVE=false
 SERVICE_WAS_ENABLED=false
 SERVICE_TOUCHED=false
 
 log(){ printf '\n==> %s\n' "$*"; }
-die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+die(){ printf '\nERROR: %s\n' "$*" >&2; if [[ "$SERVICE_TOUCHED" == true ]]; then rollback_runtime 1; fi; exit 1; }
 
 cleanup(){
-  [[ -z "$TMPDIR" ]] || rm -rf "$TMPDIR"
+  [[ -z "$BUILD_DIR" ]] || rm -rf "$BUILD_DIR"
 }
 trap cleanup EXIT
 
@@ -45,16 +45,16 @@ preflight(){
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture.";; esac
   systemctl is-active --quiet caddy && SERVICE_WAS_ACTIVE=true
   systemctl is-enabled --quiet caddy && SERVICE_WAS_ENABLED=true
+  return 0
 }
 
 candidate_version(){
-  apt-get update
+  apt-get update >&2
   local raw
-  raw="$(apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
+  raw="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
   [[ -n "$raw" && "$raw" != "(none)" ]] || die "No Caddy candidate is available from APT."
-  # Debian package versions may include a revision; the upstream binary version
-  # is the leading semantic version.
-  if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+  raw="${raw#*:}"
+  if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-+~].*)?$ ]]; then
     printf 'v%s\n' "${BASH_REMATCH[1]}"
   else
     die "Cannot map APT candidate version to an upstream Caddy version: $raw"
@@ -64,27 +64,30 @@ candidate_version(){
 download_and_verify(){
   local version="$1" asset modules
   asset="caddy-linux-${ARCH}"
-  TMPDIR="$(mktemp -d)"
+  BUILD_DIR="$(mktemp -d)"
 
   log "Downloading matching custom Caddy ${version} before upgrading APT"
-  curl -fL --retry 3 -o "${TMPDIR}/${asset}" "https://github.com/${RELEASE_REPO}/releases/download/${version}/${asset}" ||
+  curl -fL --retry 3 -o "${BUILD_DIR}/${asset}" "https://github.com/${RELEASE_REPO}/releases/download/${version}/${asset}" ||
     die "Matching custom Caddy release ${version} is not available. APT Caddy was not changed."
-  curl -fL --retry 3 -o "${TMPDIR}/SHA256SUMS" "https://github.com/${RELEASE_REPO}/releases/download/${version}/SHA256SUMS" ||
+  curl -fL --retry 3 -o "${BUILD_DIR}/SHA256SUMS" "https://github.com/${RELEASE_REPO}/releases/download/${version}/SHA256SUMS" ||
     die "SHA256SUMS for custom Caddy ${version} is not available. APT Caddy was not changed."
 
-  (cd "$TMPDIR" && grep -E "[[:space:]]+${asset}$" SHA256SUMS | sha256sum -c -) ||
+  (cd "$BUILD_DIR" && grep -E "[[:space:]]+${asset}$" SHA256SUMS | sha256sum -c -) ||
     die "SHA256 verification failed. APT Caddy was not changed."
 
-  chmod 0755 "${TMPDIR}/${asset}"
-  [[ "$(version_of "${TMPDIR}/${asset}")" == "$version" ]] || die "Downloaded custom Caddy has the wrong version."
+  chmod 0755 "${BUILD_DIR}/${asset}"
+  [[ "$(version_of "${BUILD_DIR}/${asset}")" == "$version" ]] || die "Downloaded custom Caddy has the wrong version."
 
-  modules="$("${TMPDIR}/${asset}" list-modules --packages)"
+  modules="$("${BUILD_DIR}/${asset}" list-modules --packages)"
   grep -Fq "$MODULE_L4" <<<"$modules" || die "Downloaded custom Caddy is missing caddy-l4."
   grep -Fq "$MODULE_CF_IP" <<<"$modules" || die "Downloaded custom Caddy is missing caddy-cloudflare-ip."
   grep -Fq 'caddy.adapters.jsonc github.com/caddyserver/caddy/v2' <<<"$modules" || die "Downloaded custom Caddy is missing built-in JSONC support."
 
+  # mktemp creates a root-only directory; www-data must traverse it to validate.
+  chmod 0711 "$BUILD_DIR"
   log "Validating the current configuration with the new custom binary"
-  runuser -u www-data -- env HOME=/var/lib/caddy "${TMPDIR}/${asset}" validate --config "$CONFIG" --adapter jsonc
+  runuser -u www-data -- env HOME=/var/lib/caddy "${BUILD_DIR}/${asset}" validate --config "$CONFIG" --adapter jsonc
+  apt-get install --download-only -y --only-upgrade "caddy=$PACKAGE_VERSION"
 }
 
 rollback_runtime(){
@@ -97,9 +100,12 @@ rollback_runtime(){
     ln -sfn "$CADDY_CUSTOM" /usr/bin/caddy || true
   fi
 
+  systemctl stop caddy >/dev/null 2>&1 || true
   systemctl unmask caddy >/dev/null 2>&1 || true
   if [[ "$SERVICE_WAS_ENABLED" == true ]]; then
     systemctl enable caddy >/dev/null 2>&1 || true
+  else
+    systemctl disable caddy >/dev/null 2>&1 || true
   fi
   if [[ "$SERVICE_WAS_ACTIVE" == true ]]; then
     systemctl restart caddy >/dev/null 2>&1 || true
@@ -113,7 +119,7 @@ rollback_runtime(){
 upgrade(){
   local target="$1" asset="caddy-linux-${ARCH}"
 
-  BACKUP_CUSTOM="${TMPDIR}/caddy.custom.old"
+  BACKUP_CUSTOM="${BUILD_DIR}/caddy.custom.old"
   cp -a "$CADDY_CUSTOM" "$BACKUP_CUSTOM"
 
   log "Stopping and masking Caddy"
@@ -123,13 +129,13 @@ upgrade(){
   systemctl mask caddy >/dev/null
 
   log "Upgrading the official Caddy APT package"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confold" caddy
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
 
   [[ "$(version_of "$CADDY_DEFAULT")" == "$target" ]] ||
     die "APT Caddy version does not match prepared custom Caddy ${target}."
 
   log "Installing the verified custom Caddy"
-  install -m 0755 "${TMPDIR}/${asset}" "$CADDY_CUSTOM"
+  install -m 0755 "${BUILD_DIR}/${asset}" "$CADDY_CUSTOM"
   ln -sfn "$CADDY_CUSTOM" /usr/bin/caddy
 
   [[ "$(version_of /usr/bin/caddy)" == "$target" ]] || die "Active custom Caddy version mismatch."
@@ -138,9 +144,15 @@ upgrade(){
   runuser -u www-data -- env HOME=/var/lib/caddy /usr/bin/caddy validate --config "$CONFIG" --adapter jsonc
 
   systemctl unmask caddy >/dev/null
-  systemctl enable caddy >/dev/null
-  systemctl restart caddy
-  systemctl is-active --quiet caddy || die "Caddy is not active after upgrade."
+  if [[ "$SERVICE_WAS_ENABLED" == true ]]; then
+    systemctl enable caddy >/dev/null
+  else
+    systemctl disable caddy >/dev/null
+  fi
+  if [[ "$SERVICE_WAS_ACTIVE" == true ]]; then
+    systemctl restart caddy
+    systemctl is-active --quiet caddy || die "Caddy is not active after upgrade."
+  fi
 
   trap - ERR
   SERVICE_TOUCHED=false
@@ -152,12 +164,13 @@ main(){
   local current target
   current="$(version_of "$CADDY_DEFAULT")"
   target="$(candidate_version)"
+  PACKAGE_VERSION="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
 
   log "Caddy versions"
   printf 'Installed APT Caddy: %s\n' "$current"
   printf 'APT candidate:       %s\n' "$target"
 
-  if [[ "$current" == "$target" ]]; then
+  if [[ "$current" == "$target" && "$(version_of "$CADDY_CUSTOM")" == "$target" ]]; then
     printf '\nCaddy is already up to date.\n'
     exit 0
   fi

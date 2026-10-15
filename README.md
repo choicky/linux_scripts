@@ -345,3 +345,22 @@ bash caddy/convert-services-to-www-data.sh
 ```
 
 Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy + /home/tls` layout has already been migrated.
+
+### Caddy failure-handling fixes (2026-10-16)
+
+- Install/update verify the matching custom release before stopping Caddy. A missing
+  release aborts; no automatic fallback to an older or stock binary is performed.
+- Update pre-downloads the exact APT package, validates the custom core as
+  `www-data`, and preserves the previous active/enabled state. Runtime rollback
+  restores the custom binary and service state, **not the APT package version**;
+  rerun the updater after resolving the failure to reconcile package/core versions.
+- Legacy migration retains existing service drop-ins for rollback and stops the
+  new process before restoring the old unit/configuration.
+- Identity conversion retains override/permission backups under
+  `/root/www-data-conversion.*`; failed conversion attempts restore them and
+  restart previously active services. Newly created empty directories may remain.
+- Certificate-path migration validates a staged candidate before atomically
+  replacing sing-box configuration. It does not restart sing-box automatically.
+
+Validation: `bash tests/test_caddy_update.sh`; `bash -n caddy/*.sh` (run each file
+individually). These checks do not replace installation/upgrade testing on Debian.

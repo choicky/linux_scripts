@@ -41,25 +41,22 @@ backup="${CONFIG}.before-caddy-storage-migration-$(date +%Y%m%d-%H%M%S)"
 cp -a "$CONFIG" "$backup"
 log "Backup created: $backup"
 
-# Restrict the rewrite to certificate_path/key_path lines. Other /home/tls
-# references are intentionally left untouched and reported below.
-sed -Ei '/"(certificate_path|key_path)"[[:space:]]*:/ s#"/home/tls/#"/var/lib/caddy/.local/share/caddy/#' "$CONFIG"
-
-chown root:www-data "$CONFIG"
-chmod 0640 "$CONFIG"
-
-remaining="$(grep -n -F "$OLD_ROOT" "$CONFIG" || true)"
+# Keep the running configuration intact until candidate validation succeeds.
+stage="$(mktemp /etc/sing-box/.cert-migration.XXXXXX.json)"
+trap 'rm -f "$stage"' EXIT
+cp -a "$CONFIG" "$stage"
+sed -Ei '/"(certificate_path|key_path)"[[:space:]]*:/ s#"/home/tls/#"/var/lib/caddy/.local/share/caddy/#g' "$stage"
+chown root:www-data "$stage"
+chmod 0640 "$stage"
+remaining="$(grep -n -F "$OLD_ROOT" "$stage" || true)"
 if [[ -n "$remaining" ]]; then
   printf '%s\n' "$remaining" >&2
-  cp -a "$backup" "$CONFIG"
-  die "Legacy $OLD_ROOT references remain. Original config restored; inspect manually."
+  die "Legacy references remain. Original config unchanged; inspect manually."
 fi
-
-log "Validating sing-box configuration as www-data"
-if ! runuser -u www-data -- /usr/bin/sing-box check -c "$CONFIG"; then
-  cp -a "$backup" "$CONFIG"
-  die "sing-box validation failed. Original config restored."
-fi
+log "Validating sing-box candidate as www-data"
+runuser -u www-data -- /usr/bin/sing-box check -c "$stage" ||
+  die "sing-box validation failed. Original config unchanged."
+mv -f "$stage" "$CONFIG"
 
 log "Certificate paths migrated successfully"
 grep -nE '"(certificate_path|key_path)"' "$CONFIG" || true
