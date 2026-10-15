@@ -20,6 +20,7 @@ Personal Linux server administration and deployment scripts.
 - `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
 - `sing-box/migrate-caddy-cert-paths.sh` — migrate sing-box certificate/key paths from legacy Caddy storage to the standard Caddy storage.
+- `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
 
@@ -50,6 +51,72 @@ to restore changed hosts/hostname state and reports any recovery failure.
 On success it displays the static hostname, `/etc/hostname`, and hosts entries
 for localhost and the new name. A VPS reboot is usually unnecessary; reconnect
 via SSH to see the updated shell prompt.
+
+## Fresh Debian VPS initialization
+
+Use `system/init-debian-server.sh` on fresh Debian 12/13 instances. Password
+authentication is preserved as currently configured by default; direct root SSH is disabled
+only by the explicit second phase.
+
+1. Run `prepare` from the existing administrative/root session. For images with
+   SSH password login disabled, supply your **public** key file:
+
+   ```bash
+   sudo bash system/init-debian-server.sh prepare --user ubuntu --authorized-key /path/to/admin.pub
+   ```
+
+   The key is appended without replacing existing keys. The script does not copy
+   root keys automatically. Without an explicit key, key-only images stop before
+   preparation rather than claim the new login is ready. Existing users must have
+   an active password for sudo; set one with `sudo passwd ubuntu` if necessary.
+   Optional settings: `--swap-gib 0` skips swap; default is 2 GiB, timezone
+   defaults to Asia/Shanghai.
+
+2. In a **new** terminal, test the new user's SSH login and `sudo -v`. Retain the
+   original session. Creating a user/key does not prove that AllowUsers,
+   AuthenticationMethods, PAM or other existing policies permit login.
+
+3. From a verified SSH session, preserve connection metadata when hardening:
+
+   ```bash
+   sudo env SSH_CONNECTION="$SSH_CONNECTION" bash system/init-debian-server.sh harden --user ubuntu
+   ```
+
+   Effective settings are checked for both the administrator and root using the
+   current source/destination addresses and SSH port. With `UseDNS yes`, also
+   supply `--client-host HOST` matching sshd's verified client hostname (or its
+   address when no verified reverse name exists). These checks cover this
+   connection context, not every possible source address. Test another new login
+   before closing the retained sessions. Reload/service failures restore the old
+   managed drop-in and attempt to reload it; restoration failures are reported.
+   `sshd -T -C` inspects disk configuration, not the running daemon. Reload success
+   plus an active service is not an authentication test.
+
+   `harden --password-auth keep` is the default and omits the password directive;
+   it checks that effective values are unchanged for root and the administrator.
+   To deliberately enable or disable password authentication, pass
+   `--password-auth yes` or `--password-auth no`. Verify the intended login method
+   in another session before closing existing sessions. `MaxAuthTries 4` can reject
+   clients offering many agent keys; select the intended key with `IdentitiesOnly yes`.
+   The interactive user-creation step requires a terminal; download/run the script
+   rather than piping it into bash.
+
+4. Inspect without modifying settings:
+
+   ```bash
+   sudo bash system/init-debian-server.sh status --user ubuntu
+   ```
+
+fail2ban uses all effective SSH ports, explicitly selects `nftables-multiport`,
+and installs `nftables` rather than depending on optional iptables packages.
+It does not enable the nftables service or load/flush `/etc/nftables.conf`.
+Configuration is checked before restarting fail2ban; startup polling confirms jail
+readiness, not that a ban has been installed in the kernel. Debian 12/13 integration
+checks must still verify a controlled ban/unban from a separate test address.
+Swap creation failures remove only this run's newly created, inactive swapfile;
+an active swapfile is retained, including when writing fstab fails. Run isolated regression checks with
+`python3 tests/test_init_debian_server.py`; these do not change live services
+and do not replace Debian VPS integration testing.
 
 ## Standard runtime layout
 
