@@ -12,6 +12,9 @@ readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
 NO_START=false
+BUILD_DIR=""
+cleanup(){ [[ -z "$BUILD_DIR" ]] || rm -rf "$BUILD_DIR"; }
+trap cleanup EXIT
 
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
@@ -32,13 +35,7 @@ preflight(){
 }
 
 install_caddy(){
-  log "Installing Caddy Stable from the official APT repository"
-
-  # Never let the package post-install action start the vendor Caddyfile during
-  # installation/upgrade. start_caddy() unmasks the service only after the
-  # custom binary, drop-in and configuration have been prepared and validated.
-  systemctl stop caddy >/dev/null 2>&1 || true
-  systemctl mask caddy >/dev/null
+  log "Preparing the official Caddy APT repository"
 
   apt-get update
   apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
@@ -46,40 +43,43 @@ install_caddy(){
   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
   chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" caddy
-
-  # A previous successful run may already have diverted the package binary and
-  # selected /usr/bin/caddy.custom. In that state the package-managed binary is
-  # /usr/bin/caddy.default; both fresh installs and retries are supported.
-  systemctl stop caddy
-  systemctl disable caddy >/dev/null 2>&1 || true
+  # Resolve the repository candidate before touching the running service.
+  PACKAGE_VERSION="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
+  [[ -n "$PACKAGE_VERSION" && "$PACKAGE_VERSION" != '(none)' ]] || die "No Caddy APT candidate available."
+  CADDY_VERSION="v${PACKAGE_VERSION#*:}"
+  [[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Unsupported Caddy package version: $PACKAGE_VERSION"
 }
 
-package_binary(){
-  if [[ -x "$CADDY_DEFAULT" ]]; then printf '%s\n' "$CADDY_DEFAULT"; else printf '%s\n' /usr/bin/caddy; fi
+install_caddy_package(){
+  # Downloads, checksum, version and module checks have all passed by now.
+  log "Installing verified Caddy package ${PACKAGE_VERSION}"
+  systemctl stop caddy >/dev/null 2>&1 || true
+  systemctl mask caddy >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
+  systemctl stop caddy
+  systemctl disable caddy >/dev/null 2>&1 || true
+  install -m 0755 "$BUILD_DIR/caddy-linux-${ARCH}" "$CADDY_CUSTOM"
 }
 
 download_custom_caddy(){
-  local version asset tmpdir package_bin
-  package_bin="$(package_binary)"
-  version="$("$package_bin" version | awk '{print $1}')"
-  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Cannot determine installed Caddy version."
+  local version asset
+  version="$CADDY_VERSION"
   asset="caddy-linux-${ARCH}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
+  BUILD_DIR="$(mktemp -d)"
   log "Downloading custom Caddy ${version} for linux/${ARCH}"
-  curl -fL --retry 3 -o "${tmpdir}/${asset}" "https://github.com/${RELEASE_REPO}/releases/download/${version}/${asset}"
-  curl -fL --retry 3 -o "${tmpdir}/SHA256SUMS" "https://github.com/${RELEASE_REPO}/releases/download/${version}/SHA256SUMS"
-  (cd "$tmpdir" && grep -E "[[:space:]]+${asset}$" SHA256SUMS | sha256sum -c -) || die "SHA256 verification failed for ${asset}."
-  chmod 0755 "${tmpdir}/${asset}"
-  [[ "$("${tmpdir}/${asset}" version | awk '{print $1}')" == "$version" ]] || die "Custom Caddy version does not match APT Caddy: ${version}."
+  curl -fL --retry 3 -o "${BUILD_DIR}/${asset}" "https://github.com/${RELEASE_REPO}/releases/download/${version}/${asset}" ||
+    die "Custom build ${version}/${asset} is unavailable. Publish the matching release in ${RELEASE_REPO}, then retry. Caddy service and binary have not been changed by this run."
+  curl -fL --retry 3 -o "${BUILD_DIR}/SHA256SUMS" "https://github.com/${RELEASE_REPO}/releases/download/${version}/SHA256SUMS"
+  (cd "$BUILD_DIR" && grep -E "[[:space:]]+${asset}$" SHA256SUMS | sha256sum -c -) || die "SHA256 verification failed for ${asset}."
+  chmod 0755 "${BUILD_DIR}/${asset}"
+  [[ "$("${BUILD_DIR}/${asset}" version | awk '{print $1}')" == "$version" ]] || die "Custom Caddy version does not match APT Caddy: ${version}."
   local modules
-  modules="$("${tmpdir}/${asset}" list-modules --packages)"
+  modules="$("${BUILD_DIR}/${asset}" list-modules --packages)"
   grep -Fq "$MODULE_L4" <<<"$modules" || die "Missing caddy-l4."
   grep -Fq "$MODULE_CF_IP" <<<"$modules" || die "Missing caddy-cloudflare-ip."
   grep -Fq 'caddy.adapters.jsonc github.com/caddyserver/caddy/v2' <<<"$modules" || die "Missing built-in JSONC adapter."
-  install -m 0755 "${tmpdir}/${asset}" "$CADDY_CUSTOM"
-  trap - RETURN; rm -rf "$tmpdir"
+  log "Custom binary verified; preparing the exact APT package before stopping Caddy"
+  apt-get install --download-only -y "caddy=$PACKAGE_VERSION"
 }
 
 setup_custom_binary(){
@@ -143,5 +143,5 @@ start_caddy(){
   systemctl is-active --quiet caddy || die "Caddy is not active."
 }
 
-main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; setup_custom_binary; setup_service; prepare_paths; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
+main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; setup_service; prepare_paths; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
 main "$@"
