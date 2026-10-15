@@ -23,6 +23,55 @@ Personal Linux server administration and deployment scripts.
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 
+## Fresh Debian VPS initialization
+
+Use `system/init-debian-server.sh` on fresh Debian 12/13 instances. Password
+authentication is retained by the hardening policy; direct root SSH is disabled
+only by the explicit second phase.
+
+1. Run `prepare` from the existing administrative/root session. For images with
+   SSH password login disabled, supply your **public** key file:
+
+   ```bash
+   sudo bash system/init-debian-server.sh prepare --user ubuntu --authorized-key /path/to/admin.pub
+   ```
+
+   The key is appended without replacing existing keys. The script does not copy
+   root keys automatically. Without an explicit key, key-only images stop before
+   preparation rather than claim the new login is ready. Existing users must have
+   an active password for sudo; set one with `sudo passwd ubuntu` if necessary.
+   Optional settings: `--swap-gib 0` skips swap; default is 2 GiB, timezone
+   defaults to Asia/Shanghai.
+
+2. In a **new** terminal, test the new user's SSH login and `sudo -v`. Retain the
+   original session. Creating a user/key does not prove that AllowUsers,
+   AuthenticationMethods, PAM or other existing policies permit login.
+
+3. From a verified SSH session, preserve connection metadata when hardening:
+
+   ```bash
+   sudo env SSH_CONNECTION="$SSH_CONNECTION" bash system/init-debian-server.sh harden --user ubuntu
+   ```
+
+   Effective settings are checked for both the administrator and root using the
+   current source/destination addresses and SSH port. With `UseDNS yes`, also
+   supply `--client-host HOST` matching sshd's verified client hostname (or its
+   address when no verified reverse name exists). These checks cover this
+   connection context, not every possible source address. Test another new login
+   before closing the retained sessions. Apply/check failures restore the old
+   managed drop-in and attempt to reload it; restoration failures are reported.
+
+4. Inspect without modifying settings:
+
+   ```bash
+   sudo bash system/init-debian-server.sh status --user ubuntu
+   ```
+
+fail2ban uses all effective SSH ports and waits briefly for its jail to become
+ready. Run isolated regression checks with
+`python3 tests/test_init_debian_server.py`; these do not change live services
+and do not replace Debian VPS integration testing.
+
 ## Standard runtime layout
 
 Expected final state:
