@@ -9,12 +9,13 @@ usage() {
   cat <<'EOF'
 Usage:
   sudo bash system/init-debian-server.sh prepare --user USER [--swap-gib N] [--timezone ZONE] [--authorized-key FILE]
-  sudo env SSH_CONNECTION="$SSH_CONNECTION" bash system/init-debian-server.sh harden --user USER [--client-host HOST]
+  sudo env SSH_CONNECTION="$SSH_CONNECTION" bash system/init-debian-server.sh harden --user USER [--client-host HOST] [--password-auth keep|yes|no]
   sudo bash system/init-debian-server.sh status  --user USER
 
 Defaults:
   --swap-gib 2
   --timezone Asia/Shanghai
+  --password-auth keep (harden only)
 
 Workflow:
   1. Run "prepare".
@@ -22,8 +23,8 @@ Workflow:
   3. Keep that verified session open and run "harden".
   4. Open another new terminal and verify USER can still log in.
 
-Password authentication intentionally remains enabled. Direct root SSH login is
-disabled only in the explicit "harden" phase.
+Password authentication is unchanged by default. Use --password-auth yes|no to
+change it explicitly. Direct root SSH is disabled only during "harden".
 EOF
 }
 
@@ -42,6 +43,8 @@ shift
 ADMIN_USER=""
 AUTHORIZED_KEY=""
 CLIENT_HOST=""
+PASSWORD_AUTH=keep
+declare -A PASSWORD_BEFORE=()
 SWAP_GIB=2
 TIMEZONE="Asia/Shanghai"
 
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) [[ $# -ge 2 ]] || die "--user requires a value"; ADMIN_USER="$2"; shift 2 ;;
     --swap-gib) [[ $# -ge 2 ]] || die "--swap-gib requires a value"; SWAP_GIB="$2"; shift 2 ;;
+    --password-auth) [[ $# -ge 2 ]] || die "--password-auth requires keep, yes, or no"; PASSWORD_AUTH="$2"; shift 2 ;;
     --client-host) [[ $# -ge 2 ]] || die "--client-host requires a value"; CLIENT_HOST="$2"; shift 2 ;;
     --authorized-key) [[ $# -ge 2 ]] || die "--authorized-key requires a public key file"; AUTHORIZED_KEY="$2"; shift 2 ;;
     --timezone) [[ $# -ge 2 ]] || die "--timezone requires a value"; TIMEZONE="$2"; shift 2 ;;
@@ -61,6 +65,8 @@ done
 [[ -n "$ADMIN_USER" ]] || die "--user USER is required."
 [[ "$ADMIN_USER" != root ]] || die "Choose a non-root administrative user."
 [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid user name."
+[[ "$PASSWORD_AUTH" =~ ^(keep|yes|no)$ ]] || die "--password-auth must be keep, yes, or no."
+[[ "$ACTION" == harden || "$PASSWORD_AUTH" == keep ]] || die "--password-auth is only supported by harden."
 [[ "$SWAP_GIB" =~ ^[0-9]+$ ]] || die "--swap-gib must be a non-negative integer."
 
 source /etc/os-release
@@ -121,7 +127,18 @@ install_admin_key() {
   ok "Administrator public key installed; existing keys retained."
 }
 
-setup_swap() {
+setup_swap() (
+  # A subshell confines cleanup to this operation. Never delete an active swap.
+  local created=false
+  cleanup_swap() {
+    local rc=$?
+    if (( rc != 0 )) && [[ "$created" == true ]] &&
+       ! swapon --noheadings --show=NAME | grep -Fxq /swapfile; then
+      rm -f /swapfile
+    fi
+    exit "$rc"
+  }
+  trap cleanup_swap EXIT
   (( SWAP_GIB > 0 )) || { skipped "Swap creation disabled (--swap-gib 0)."; return; }
 
   if swapon --noheadings --show=NAME | grep -q .; then
@@ -141,6 +158,7 @@ setup_swap() {
     die "Not enough free disk space for ${SWAP_GIB} GiB swap plus 1 GiB safety margin."
 
   log "Creating ${SWAP_GIB} GiB swapfile"
+  created=true
   if ! fallocate -l "${SWAP_GIB}G" /swapfile; then
     rm -f /swapfile
     dd if=/dev/zero of=/swapfile bs=1M count="$((SWAP_GIB * 1024))" status=progress
@@ -156,7 +174,7 @@ setup_swap() {
     changed "Added /swapfile to /etc/fstab."
   fi
   changed "Enabled ${SWAP_GIB} GiB swapfile."
-}
+)
 
 configure_fail2ban() {
   log "Configuring fail2ban for SSH"
@@ -171,6 +189,7 @@ configure_fail2ban() {
 enabled = true
 port = $ports
 backend = systemd
+banaction = nftables-multiport
 maxretry = 5
 findtime = 10m
 bantime = 1h
@@ -185,6 +204,7 @@ EOF
   fi
   rm -f "$tmp"
 
+  fail2ban-client -t >/dev/null || die "fail2ban configuration validation failed."
   systemctl enable fail2ban >/dev/null
   if systemctl is-active --quiet fail2ban; then
     systemctl restart fail2ban
@@ -233,7 +253,9 @@ check_ssh_hardened() {
   max_auth="$(ssh_effective_value maxauthtries "$user")"
 
   [[ "$root_login" == "no" ]] || { echo "Effective PermitRootLogin is '$root_login', expected 'no'." >&2; return 1; }
-  [[ "$password_auth" == "yes" ]] || { echo "Effective PasswordAuthentication is '$password_auth', expected 'yes'." >&2; return 1; }
+  local expected_password="$PASSWORD_AUTH"
+  if [[ "$PASSWORD_AUTH" == keep ]]; then expected_password="${PASSWORD_BEFORE[$user]}"; fi
+  [[ "$password_auth" == "$expected_password" ]] || { echo "Effective PasswordAuthentication for $user is '$password_auth', expected '$expected_password'." >&2; return 1; }
   [[ "$kbd_auth" == "no" ]] || { echo "Effective KbdInteractiveAuthentication is '$kbd_auth', expected 'no'." >&2; return 1; }
   [[ "$pubkey_auth" == "yes" ]] || { echo "Effective PubkeyAuthentication is '$pubkey_auth', expected 'yes'." >&2; return 1; }
   [[ "$max_auth" == "4" ]] || { echo "Effective MaxAuthTries is '$max_auth', expected '4'." >&2; return 1; }
@@ -250,7 +272,7 @@ prepare() {
   log "Updating APT metadata and ensuring baseline packages are installed"
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    sudo fail2ban ca-certificates curl git rsync vim-tiny
+    sudo fail2ban nftables ca-certificates curl git rsync vim-tiny
 
   if [[ "$(timedatectl show -p Timezone --value)" == "$TIMEZONE" ]]; then
     skipped "Timezone is already $TIMEZONE."
@@ -282,6 +304,8 @@ EOF
 harden() {
   verify_admin_user
   ssh_config_for "$ADMIN_USER" >/dev/null
+  PASSWORD_BEFORE[$ADMIN_USER]="$(ssh_effective_value passwordauthentication "$ADMIN_USER")"
+  PASSWORD_BEFORE[root]="$(ssh_effective_value passwordauthentication root)"
   command -v sshd >/dev/null 2>&1 || die "sshd not found."
 
   log "Preparing SSH hardening drop-in"
@@ -291,13 +315,15 @@ harden() {
   tmp="$(mktemp)"
   cat >"$tmp" <<'EOF'
 # Managed by linux_scripts/system/init-debian-server.sh
-# Password login remains enabled by design; direct root SSH login is disabled.
+# Direct root SSH is disabled; password authentication is unchanged unless requested.
 PermitRootLogin no
-PasswordAuthentication yes
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 MaxAuthTries 4
 EOF
+  if [[ "$PASSWORD_AUTH" != keep ]]; then
+    printf 'PasswordAuthentication %s\n' "$PASSWORD_AUTH" >> "$tmp"
+  fi
 
   if [[ -f "$cfg" ]] && cmp -s "$tmp" "$cfg"; then
     skipped "$cfg already has the desired content."
@@ -320,7 +346,7 @@ EOF
     die "sshd syntax validation failed; previous drop-in state restored when changed."
   fi
 
-  # Verify the merged/effective configuration BEFORE touching the running daemon.
+  # Verify the disk configuration for this connection before requesting reload.
   if ! check_ssh_hardened "$ADMIN_USER" || ! check_ssh_hardened root; then
     if (( cfg_changed )); then
       if [[ -n "$backup" ]]; then cp -a "$backup" "$cfg"; else rm -f "$cfg"; fi
@@ -328,9 +354,9 @@ EOF
     die "Effective SSH policy did not match expectations; previous drop-in state restored when changed."
   fi
 
-  # Restore the file and reload the previous policy on any apply/check failure.
-  if ! systemctl reload ssh || ! systemctl is-active --quiet ssh ||
-     ! check_ssh_hardened "$ADMIN_USER" || ! check_ssh_hardened root; then
+  # A successful reload and active service do not prove a new SSH login works.
+  # sshd -T reads disk configuration, not the daemon's in-memory state.
+  if ! systemctl reload ssh || ! systemctl is-active --quiet ssh; then
     if (( cfg_changed )); then
       if [[ -n "$backup" ]]; then cp -a "$backup" "$cfg"; else rm -f "$cfg"; fi
     fi
@@ -349,7 +375,8 @@ Keep this session open. In another NEW terminal verify:
   ssh $ADMIN_USER@SERVER
   sudo -v
 
-Expected: password login works for $ADMIN_USER; direct root SSH login is refused.
+Expected: the verified login method still works; direct root SSH login is refused.
+PasswordAuthentication policy: $PASSWORD_AUTH (keep preserves the prior policy).
 EOF
 }
 

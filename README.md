@@ -26,7 +26,7 @@ Personal Linux server administration and deployment scripts.
 ## Fresh Debian VPS initialization
 
 Use `system/init-debian-server.sh` on fresh Debian 12/13 instances. Password
-authentication is retained by the hardening policy; direct root SSH is disabled
+authentication is preserved as currently configured by default; direct root SSH is disabled
 only by the explicit second phase.
 
 1. Run `prepare` from the existing administrative/root session. For images with
@@ -58,8 +58,19 @@ only by the explicit second phase.
    supply `--client-host HOST` matching sshd's verified client hostname (or its
    address when no verified reverse name exists). These checks cover this
    connection context, not every possible source address. Test another new login
-   before closing the retained sessions. Apply/check failures restore the old
+   before closing the retained sessions. Reload/service failures restore the old
    managed drop-in and attempt to reload it; restoration failures are reported.
+   `sshd -T -C` inspects disk configuration, not the running daemon. Reload success
+   plus an active service is not an authentication test.
+
+   `harden --password-auth keep` is the default and omits the password directive;
+   it checks that effective values are unchanged for root and the administrator.
+   To deliberately enable or disable password authentication, pass
+   `--password-auth yes` or `--password-auth no`. Verify the intended login method
+   in another session before closing existing sessions. `MaxAuthTries 4` can reject
+   clients offering many agent keys; select the intended key with `IdentitiesOnly yes`.
+   The interactive user-creation step requires a terminal; download/run the script
+   rather than piping it into bash.
 
 4. Inspect without modifying settings:
 
@@ -67,8 +78,14 @@ only by the explicit second phase.
    sudo bash system/init-debian-server.sh status --user ubuntu
    ```
 
-fail2ban uses all effective SSH ports and waits briefly for its jail to become
-ready. Run isolated regression checks with
+fail2ban uses all effective SSH ports, explicitly selects `nftables-multiport`,
+and installs `nftables` rather than depending on optional iptables packages.
+It does not enable the nftables service or load/flush `/etc/nftables.conf`.
+Configuration is checked before restarting fail2ban; startup polling confirms jail
+readiness, not that a ban has been installed in the kernel. Debian 12/13 integration
+checks must still verify a controlled ban/unban from a separate test address.
+Swap creation failures remove only this run's newly created, inactive swapfile;
+an active swapfile is retained, including when writing fstab fails. Run isolated regression checks with
 `python3 tests/test_init_debian_server.py`; these do not change live services
 and do not replace Debian VPS integration testing.
 
