@@ -30,6 +30,12 @@ class DirectoryPlanTests(unittest.TestCase):
             self.assertIn(str(asset.parent),result['keep'])
             self.assertEqual(result['exclude'],[str(old)])
 
+    def test_file_server_hide_is_not_a_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            result=self.inspect(root,{'handler':'file_server','hide':['./Caddyfile',str(root/'Caddyfile')]})
+            self.assertEqual(result['keep'],[str(root/'caddy.jsonc')])
+
     def test_relative_dependency_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError,'relative file'):

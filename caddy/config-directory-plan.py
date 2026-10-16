@@ -18,7 +18,15 @@ def plan(configs):
     # Native JSON/JSONC configurations have no adapter imports. Preserve local
     # file/directory references, including rule sets and TLS/client-auth files.
     for config in configs:
-        for key, (_, _, value) in module.document(config)[2].items():
+        _, document, spans = module.document(config)
+        for key, (_, _, value) in spans.items():
+            # file_server.hide is an access exclusion, not a file to load.
+            if len(key) >= 2 and key[-2] == 'hide' and isinstance(key[-1], int):
+                parent = document
+                for part in key[:-2]:
+                    parent = parent[part]
+                if isinstance(parent, dict) and parent.get('handler') == 'file_server':
+                    continue
             if not isinstance(value, str):
                 continue
             path = Path(value)
