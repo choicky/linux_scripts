@@ -87,7 +87,7 @@ class ScanTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False, failure_code=9, version_skew=False, prepare_fail=False):
+    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False, failure_code=9, version_skew=False, prepare_fail=False, directory=False, extra_json=False, fail_restart=False, missing_source=False):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp); fs = d/'fs'; scripts = d/'scripts'; scripts.mkdir()
             for p in ['etc/caddy','etc/sing-box','etc/systemd/system/caddy.service.d','usr/bin','usr/lib/systemd/system','home/tls/certificates','var/lib/caddy/.local/share/caddy/certificates','var/lib/sing-box','run/lock','tmp']:
@@ -96,6 +96,9 @@ class LifecycleTests(unittest.TestCase):
             (Path(old)/'certificates/a.crt').write_text('SOURCE CERT')
             (Path(new)/'certificates/a.crt').write_text('PREVIOUS DESTINATION CERT')
             source = new if noop or path_only else old
+            if missing_source:
+                import shutil
+                shutil.rmtree(Path(old))
             c = fs/'etc/caddy/caddy.jsonc'; s = fs/'etc/sing-box/config.json'
             c.write_text(json.dumps({'storage':{'module':'file_system','root':source}}))
             s.write_text(json.dumps({'inbounds':[{'tls':{'certificate_path':source+'/certificates/a.crt'}}]}))
@@ -123,6 +126,14 @@ class LifecycleTests(unittest.TestCase):
             (fs/'usr/bin/caddy').symlink_to(fs/'usr/bin/caddy.custom')
             helper=(ROOT/'caddy/migration-config.py').read_text().replace("OLD = '/home/tls'",f'OLD = {old!r}').replace("NEW = '/var/lib/caddy/.local/share/caddy'",f'NEW = {new!r}')
             (scripts/'migration-config.py').write_text(helper)
+            launch=(ROOT/'caddy/sing-box-service-plan.py').read_text()
+            launch=re.sub(r'/(?:etc/|var/lib/)',lambda m:str(fs)+m[0],launch)
+            (scripts/'sing-box-service-plan.py').write_text(launch)
+            if extra_json:(fs/'etc/sing-box/extra.json').write_text('{}')
+            launch_dropin=fs/'etc/systemd/system/sing-box.service.d/zzzz-caddy-single-file.conf'
+            (fs/'etc/systemd/system/sing-box.service.d').mkdir(parents=True,exist_ok=True)
+            preserved=fs/'etc/systemd/system/sing-box.service.d/user.conf'
+            preserved.write_text('[Service]\nUser=www-data\n')
             scanner=(ROOT/'caddy/scan-legacy-paths.py').read_text()
             scanner=re.sub(r'/(?:usr/lib/|etc/)',lambda m:str(fs)+m[0],scanner)
             (scripts/'scan-legacy-paths.py').write_text(scanner)
@@ -152,10 +163,14 @@ ln -sfn '{fs}/usr/bin/caddy.custom' '{fs}/usr/bin/caddy'
             bins=d/'bin';bins.mkdir();calls=d/'calls'
             systemctl=f'''#!/bin/bash
 printf '%s\\n' "$*" >> '{calls}'
+if [[ '{str(fail_restart).lower()}' == true && "$*" == 'restart sing-box' ]]; then exit 9; fi
 if [[ "$1" == show ]]; then
  case "$*" in
  *User*|*Group*) echo www-data;;
- *ExecStart*) if [[ "$2" == caddy ]]; then echo 'ExecStart={{ path={fs}/usr/bin/caddy ; argv[]={fs}/usr/bin/caddy run --config {c} --adapter jsonc ; }}'; else echo 'ExecStart={{ path={fs}/usr/bin/sing-box ; argv[]={fs}/usr/bin/sing-box -c {s} run ; }}'; fi;;
+ *ExecStart*) if [[ "$2" == caddy ]]; then echo 'ExecStart={{ path={fs}/usr/bin/caddy ; argv[]={fs}/usr/bin/caddy run --config {c} --adapter jsonc ; }}'; else
+ if [[ '{str(directory).lower()}' == true && ! -f '{launch_dropin}' ]]; then mode='-C {s.parent}'; else mode='-c {s}'; fi
+ echo "ExecStart={{ path={fs}/usr/bin/sing-box ; argv[]={fs}/usr/bin/sing-box -D {fs}/var/lib/sing-box $mode run ; }}"
+ fi;;
  *FragmentPath*) if [[ -f '{fragment}' ]]; then echo '{fragment}'; else echo '{fs}/usr/lib/systemd/system/caddy.service'; fi;;
  *DropInPaths*) echo '{fs}/etc/systemd/system/caddy.service.d/override.conf';;
  esac
@@ -172,20 +187,25 @@ exit 0
             script=scripts/'migrate-caddy-debian.sh';script.write_text(src)
             env=dict(os.environ,PATH=str(bins)+':'+os.environ['PATH'])
             r=subprocess.run(['bash',str(script)]+([] if plan else ['--apply']),env=env,text=True,capture_output=True)
-            self.assertEqual(r.returncode, 4 if residual or retained_dropin else 8 if install_fail or prepare_fail else (1 if failure_code in (3,4) else failure_code) if fail else 3 if noop else 0, r.stdout+r.stderr)
+            self.assertEqual(r.returncode, 1 if extra_json else 9 if fail_restart else 4 if residual or retained_dropin else 8 if install_fail or prepare_fail else (1 if failure_code in (3,4) else failure_code) if fail else 3 if noop and not directory else 0, r.stdout+r.stderr)
             logs=calls.read_text()
-            if fail or install_fail or prepare_fail or residual or retained_dropin or plan or noop:
+            self.assertEqual(preserved.read_text(),'[Service]\nUser=www-data\n')
+            if directory and noop:
+                self.assertNotIn('stop caddy',logs);self.assertNotIn('restart caddy',logs)
+            if directory:
+                self.assertEqual(launch_dropin.exists(), not (fail or fail_restart or extra_json or plan))
+            if fail or fail_restart or extra_json or install_fail or prepare_fail or residual or retained_dropin or plan or (noop and not directory):
                 self.assertEqual((c.read_bytes(),s.read_bytes()),before)
             else:
                 self.assertIn(new,c.read_text())
                 if not caddy_only:self.assertIn(new,s.read_text())
-                if not path_only:self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'SOURCE CERT')
+                if not path_only and not noop and not missing_source:self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'SOURCE CERT')
             if fail:
                 if legacy:
                     self.assertFalse((fs/'usr/bin/caddy').is_symlink())
                 self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'PREVIOUS DESTINATION CERT')
                 self.assertIn('restart caddy',logs);self.assertIn('restart sing-box',logs)
-            if plan or noop or prepare_fail or residual or retained_dropin:self.assertNotIn('stop ',logs);self.assertNotIn('restart ',logs)
+            if plan or (noop and not directory) or extra_json or prepare_fail or residual or retained_dropin:self.assertNotIn('stop ',logs);self.assertNotIn('restart ',logs)
             if path_only:
                 self.assertNotIn('stop caddy',logs);self.assertNotIn('restart caddy',logs)
                 self.assertIn('restart sing-box',logs)
@@ -203,8 +223,16 @@ exit 0
                 self.assertIn('restart caddy',logs)
             if residual:
                 self.assertIn('config.json:1' if residual == 'main' else 'other.json:1',r.stderr)
-            self.assertEqual((Path(old)/'certificates/a.crt').read_text(),'SOURCE CERT')
+            if not missing_source:self.assertEqual((Path(old)/'certificates/a.crt').read_text(),'SOURCE CERT')
 
+    def test_directory_only_conversion_does_not_restart_caddy(self):
+        self.exercise(directory=True,noop=True)
+    def test_absent_legacy_storage_reuses_standard_storage(self):self.exercise(missing_source=True)
+    def test_directory_launch_is_converted_with_storage(self):self.exercise(directory=True)
+    def test_directory_plan_never_changes_unit(self):self.exercise(directory=True,plan=True)
+    def test_directory_extra_json_blocks_before_changes(self):self.exercise(directory=True,extra_json=True)
+    def test_directory_restart_failure_restores_launch_and_configs(self):self.exercise(directory=True,fail_restart=True)
+    def test_directory_validation_failure_keeps_old_launch(self):self.exercise(directory=True,fail=True)
     def test_version_skew_plans_full_reconciliation(self):self.exercise(plan=True,version_skew=True)
     def test_preparation_failure_never_stops_services(self):self.exercise(legacy=True,prepare_fail=True)
     def test_failure_code_three_is_not_reported_as_skipped(self):self.exercise(fail=True,failure_code=3)

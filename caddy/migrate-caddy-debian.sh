@@ -8,6 +8,11 @@ SING=/etc/sing-box/config.json
 NEW=/var/lib/caddy/.local/share/caddy
 APPLY=false
 STORAGE_ONLY=false
+CONFIG_ONLY=false
+SING_UNIT_CHANGE=false
+SING_UNIT_WRITTEN=false
+SING_UNIT_EXISTED=false
+SING_UNIT=/etc/systemd/system/sing-box.service.d/zzzz-caddy-single-file.conf
 CHANGED=false
 STORAGE_MOVED=false
 NEW_CREATED=false
@@ -24,9 +29,9 @@ SING_TOUCHED=false
 RESULT_CODE=0
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
-usage(){ echo "Usage: $0 [--apply] [--storage-only]"; }
+usage(){ echo "Usage: $0 [--apply] [--storage-only] [--config-only]"; }
 for arg in "$@"; do
-  case "$arg" in --apply) APPLY=true;; --storage-only) STORAGE_ONLY=true;; -h|--help) usage; exit 0;; *) usage >&2; die "Unknown option: $arg";; esac
+  case "$arg" in --apply) APPLY=true;; --storage-only) STORAGE_ONLY=true;; --config-only) CONFIG_ONLY=true;; -h|--help) usage; exit 0;; *) usage >&2; die "Unknown option: $arg";; esac
 done
 
 rollback(){
@@ -60,6 +65,14 @@ rollback(){
       fi
       rm -rf /etc/systemd/system/caddy.service.d
       if [[ -d "$BACKUP/dropins" ]]; then cp -a "$BACKUP/dropins" /etc/systemd/system/caddy.service.d || failed=1; fi
+    fi
+    if [[ "$SING_UNIT_WRITTEN" == true ]]; then
+      if [[ "$SING_UNIT_EXISTED" == true ]]; then
+        cp -a "$BACKUP/sing-box-launch.conf" "$SING_UNIT" || failed=1
+      else
+        rm -f -- "$SING_UNIT" || failed=1
+      fi
+      systemctl daemon-reload || failed=1
     fi
     if [[ "$CADDY_TOUCHED" == true ]]; then
     systemctl daemon-reload || failed=1
@@ -104,7 +117,7 @@ exec 9>/run/lock/caddy-migration.lock
 flock -n 9 || die 'Another Caddy migration is running.'
 getent passwd www-data >/dev/null && getent group www-data >/dev/null || die 'www-data account/group required.'
 [[ -f "$CONFIG" && ! -L "$CONFIG" ]] || die 'Expected regular /etc/caddy/caddy.jsonc.'
-[[ -f "$SCRIPT_DIR/migration-config.py" && -f "$SCRIPT_DIR/scan-legacy-paths.py" && -f "$SCRIPT_DIR/install-caddy-debian.sh" ]] || die 'Run from a complete repository checkout.'
+[[ -f "$SCRIPT_DIR/migration-config.py" && -f "$SCRIPT_DIR/scan-legacy-paths.py" && -f "$SCRIPT_DIR/install-caddy-debian.sh" && -f "$SCRIPT_DIR/sing-box-service-plan.py" ]] || die 'Run from a complete repository checkout.'
 systemctl is-active --quiet caddy || die 'Caddy must be active before migration.'
 [[ "$(systemctl show caddy -p User --value)" == www-data && "$(systemctl show caddy -p Group --value)" == www-data ]] || die 'Expected Caddy running as www-data:www-data; review identity conversion first.'
 START="$(systemctl show caddy -p ExecStart --value)"
@@ -123,7 +136,13 @@ if [[ -e "$SING" ]]; then
   SING_PRESENT=true
   [[ "$(systemctl show sing-box -p User --value)" == www-data && "$(systemctl show sing-box -p Group --value)" == www-data ]] || die 'Expected sing-box running as www-data:www-data.'
   SING_START="$(systemctl show sing-box -p ExecStart --value)"
-  [[ "$SING_START" == *"$SING"* && "$SING_START" != *"-C "* && "$SING_START" != *"--config-directory"* ]] || die 'Expected sing-box single-file configuration.'
+  SING_PLAN="$(python3 "$SCRIPT_DIR/sing-box-service-plan.py" "$SING_START")" || die 'Review sing-box configuration inputs before converting to single-file mode.'
+  if [[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["change"])' "$SING_PLAN")" == True ]]; then
+    SING_UNIT_CHANGE=true
+    [[ ! -L "$SING_UNIT" ]] || die 'Managed sing-box launch drop-in must not be a symlink.'
+    [[ ! -e "$SING_UNIT" || -f "$SING_UNIT" ]] || die 'Managed sing-box launch drop-in must be a regular file.'
+    log "Will replace directory loading with single-file loading: $SING"
+  fi
   SING_CORE="$(sed -n 's/.*path=\([^ ;]*\).*/\1/p' <<<"$SING_START")"
   [[ -x "$SING_CORE" ]] || die 'Missing service sing-box executable.'
   if systemctl is-active --quiet sing-box; then SING_ACTIVE=true; fi
@@ -141,11 +160,17 @@ if [[ -L /usr/bin/caddy && "$(readlink -f /usr/bin/caddy)" == /usr/bin/caddy.cus
   if [[ -n "$STOCK_VERSION" && "$STOCK_VERSION" == "$CUSTOM_VERSION" ]]; then STANDARD=true; fi
 fi
 [[ "$STORAGE_ONLY" == false || "$STANDARD" == true ]] || die '--storage-only requires standard binary/service layout.'
+[[ "$CONFIG_ONLY" == false || "$STANDARD" == true ]] || die '--config-only requires verified standard binaries; no package changes permitted.'
 WORK="$(mktemp -d /tmp/caddy-reconcile.XXXXXXXX)"
 SING_ARG=-
 [[ "$SING_PRESENT" == false ]] || SING_ARG="$SING"
 python3 "$SCRIPT_DIR/migration-config.py" "$CONFIG" "$SING_ARG" "$WORK/caddy.jsonc" "$WORK/sing-box.json" > "$WORK/plan.json"
 SOURCE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source"])' "$WORK/plan.json")"
+CONFIGURED_SOURCE="$SOURCE"
+if [[ "$SOURCE" != "$NEW" && ! -e "$SOURCE" && ! -L "$SOURCE" && -d "$NEW/certificates" ]]; then
+  log "Configured storage is absent; reusing existing standard storage: $NEW"
+  SOURCE="$NEW"
+fi
 [[ -d "$SOURCE" && ! -L "$SOURCE" && -d "$SOURCE/certificates" ]] || die "Missing real certificate storage: $SOURCE"
 [[ ! -L "$NEW" ]] || die 'Destination storage must not be a symlink.'
 for path in /var/lib/caddy /var/lib/caddy/.local /var/lib/caddy/.local/share; do
@@ -157,7 +182,7 @@ done
 SING_CHANGES="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sing_changes"])' "$WORK/plan.json")"
 SING_REFERENCES="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["references"]))' "$WORK/plan.json")"
 CADDY_CHANGE=false
-[[ "$STANDARD" == true && "$SOURCE" == "$NEW" ]] || CADDY_CHANGE=true
+[[ "$STANDARD" == true && "$CONFIGURED_SOURCE" == "$NEW" ]] || CADDY_CHANGE=true
 log "Standard installation: $STANDARD; Caddy storage: $SOURCE; sing-box path changes: $SING_CHANGES"
 python3 "$SCRIPT_DIR/scan-legacy-paths.py" --changes "$CONFIG" "$SING_ARG" "$WORK/caddy.jsonc" "$WORK/sing-box.json"
 # Ignore only files this transaction will remove or overwrite. Other drop-ins
@@ -172,7 +197,7 @@ if ! scan_legacy "$WORK/caddy.jsonc" "$WORK/sing-box.json" "${PLAN_EXCLUDES[@]}"
   echo 'CADDY_MIGRATION_RESULT=BLOCKED'
   exit 4
 fi
-if [[ "$STANDARD" == true && "$SOURCE" == "$NEW" && "$SING_CHANGES" == 0 ]]; then
+if [[ "$STANDARD" == true && "$CONFIGURED_SOURCE" == "$NEW" && "$SING_CHANGES" == 0 && "$SING_UNIT_CHANGE" == false ]]; then
   runuser -u www-data -- env HOME=/var/lib/caddy "$CORE" validate --config "$CONFIG" --adapter jsonc
   [[ "$SING_PRESENT" == false ]] || runuser -u www-data -- "$SING_CORE" -D /var/lib/sing-box check -c "$SING"
   log 'Already standardized; no files changed and no services restarted.'
@@ -194,6 +219,10 @@ BACKUP="/root/caddy-migration-backup/$RUN_ID"
 install -d -m 0700 "$BACKUP"
 cp -a "$CONFIG" "$BACKUP/caddy.jsonc"
 [[ "$SING_PRESENT" == false ]] || cp -a "$SING" "$BACKUP/sing-box.json"
+if [[ "$SING_UNIT_CHANGE" == true && -f "$SING_UNIT" ]]; then
+  SING_UNIT_EXISTED=true
+  cp -a "$SING_UNIT" "$BACKUP/sing-box-launch.conf"
+fi
 cp -a "$FRAGMENT" "$BACKUP/fragment"
 if [[ -d /etc/systemd/system/caddy.service.d ]]; then cp -a /etc/systemd/system/caddy.service.d "$BACKUP/dropins"; fi
 for path in /usr/bin/caddy /usr/bin/caddy.custom /usr/bin/caddy.default /usr/local/bin/caddy; do
@@ -207,7 +236,7 @@ CHANGED=true
 if [[ "$CADDY_CHANGE" == true ]]; then CADDY_TOUCHED=true; systemctl stop caddy; fi
 # Stop sing-box only if its certificate references will change, or its old
 # references might be invalid while storage is replaced. Preserve inactive state.
-if [[ "$SING_ACTIVE" == true && ( "$SING_CHANGES" != 0 || ( "$SOURCE" != "$NEW" && "$SING_REFERENCES" != 0 ) ) ]]; then
+if [[ "$SING_ACTIVE" == true && ( "$SING_UNIT_CHANGE" == true || "$SING_CHANGES" != 0 || ( "$SOURCE" != "$NEW" && "$SING_REFERENCES" != 0 ) ) ]]; then
   SING_TOUCHED=true
   systemctl stop sing-box
 fi
@@ -238,12 +267,23 @@ CSTAGE="/etc/caddy/.migration-$RUN_ID.jsonc"
 install -o root -g www-data -m 0640 "$WORK/caddy.jsonc" "$CSTAGE"
 runuser -u www-data -- env HOME=/var/lib/caddy "$CORE" validate --config "$CSTAGE" --adapter jsonc
 fi
-if [[ "$SING_CHANGES" != 0 ]]; then
+if [[ "$SING_CHANGES" != 0 || "$SING_UNIT_CHANGE" == true ]]; then
   SSTAGE="/etc/sing-box/.migration-$RUN_ID.json"
   install -o root -g www-data -m 0640 "$WORK/sing-box.json" "$SSTAGE"
   runuser -u www-data -- "$SING_CORE" -D /var/lib/sing-box check -c "$SSTAGE"
 fi
 if [[ "$SING_CHANGES" != 0 ]]; then mv -f -- "$SSTAGE" "$SING"; fi
+if [[ "$SING_UNIT_CHANGE" == true ]]; then
+  install -d -m 0755 /etc/systemd/system/sing-box.service.d
+  SING_UNIT_WRITTEN=true
+  printf '[Service]\nExecStart=\nExecStart=%s -D /var/lib/sing-box -c %s run\n' "$SING_CORE" "$SING" > "$SING_UNIT"
+  chmod 0644 "$SING_UNIT"
+  systemctl daemon-reload
+  FINAL_SING_START="$(systemctl show sing-box -p ExecStart --value)"
+  FINAL_SING_PLAN="$(python3 "$SCRIPT_DIR/sing-box-service-plan.py" "$FINAL_SING_START")"
+  [[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["change"])' "$FINAL_SING_PLAN")" == False ]] || die 'Single-file drop-in did not take effect.'
+  [[ "$(systemctl show sing-box -p User --value)" == www-data && "$(systemctl show sing-box -p Group --value)" == www-data ]] || die 'Unexpected sing-box runtime identity.'
+fi
 if [[ "$CADDY_CHANGE" == true ]]; then
 mv -f -- "$CSTAGE" "$CONFIG"
 systemctl unmask caddy >/dev/null
@@ -265,3 +305,4 @@ echo 'CADDY_MIGRATION_RESULT=APPLIED'
 log "SUCCESS: standard layout and certificate paths. Backup: $BACKUP"
 echo 'Retain /home/tls and destination backup until actual websites/proxy nodes have been tested.'
 systemctl show caddy -p User -p Group -p ExecStart --no-pager
+[[ "$SING_PRESENT" == false ]] || systemctl show sing-box -p User -p Group -p ExecStart --no-pager

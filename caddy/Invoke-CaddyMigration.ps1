@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory=$true)]
     [ValidatePattern('^[0-9a-f]{40}$')][string]$Revision,
     [Parameter(Mandatory=$true)][string[]]$Targets,
+    [switch]$ConfigOnly,
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,7 @@ try {
         # subtree from the exact revision downloaded above, into a private dir.
         $flag = ''
         if ($Apply) { $flag = '--apply' }
+        if ($ConfigOnly) { $flag += ' --config-only' }
         $remote = @'
 set -eu
 archive="$HOME/__NAME__"

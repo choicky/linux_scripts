@@ -239,7 +239,11 @@ the reported cause and rerun.
 
 The migration reconciles existing manual and already standardized Caddy layouts.
 It supports Debian 12/13, JSONC at `/etc/caddy/caddy.jsonc`, an active Caddy,
-and Caddy/sing-box already running as `www-data:www-data`. Unexpected layouts,
+and Caddy/sing-box already running as `www-data:www-data`.
+Sing-box directory loading at `/etc/sing-box` is converted in the same transaction
+only when its sole JSON/JSONC input is `config.json`; extra inputs are listed and
+block conversion instead of being silently discarded. A dedicated ExecStart-only
+drop-in preserves other service settings and is restored on migration failure. Unexpected layouts,
 service identities, external drop-ins, storage symlinks or config directories
 stop during preflight for review. Use the compatibility conversion below first
 when the runtime identities differ; do not apply it blindly to every server.
@@ -249,6 +253,8 @@ cd /root/linux_scripts
 git pull --ff-only
 # Plan: does not stop services or install packages.
 bash caddy/migrate-caddy-debian.sh
+# For already verified installations: never install/upgrade packages:
+bash caddy/migrate-caddy-debian.sh --config-only
 # Execute the reviewed plan:
 bash caddy/migrate-caddy-debian.sh --apply
 # Optional: refuse a binary migration, allow storage-only on a standard layout:
@@ -274,7 +280,9 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
   symlinks; links to files outside the scan roots are still inspected.
   The post-apply scan has no such exclusions.
   Backup filenames with .bak/.old/.before-/.migration- are excluded;
-  names such as caddy.jsonc.orig and config.json~ are intentionally still reported.
+  Confirmed dated backup names `caddy.jsonc-good-YYYYMMDD` and
+  `config.json-good-YYYYMMDD` are reported as ignored and left untouched.
+  Names such as caddy.jsonc.orig and config.json~ are intentionally still reported.
   Review these files before moving backups outside scanned directories;
   inspect custom consumers outside
   these directories separately. Comments containing old paths can also trigger review.
@@ -298,8 +306,8 @@ uploads the same scripts to each SSH alias. Targets must be supplied explicitly 
 remaining hosts. Use a commit containing these scripts, not a moving branch name.
 
 ```powershell
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets kr3
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets kr3 -Apply
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly -Apply
 # After checking KR3, explicitly choose the next hosts:
 .\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk,sg -Apply
 ```

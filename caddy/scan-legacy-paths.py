@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Report legacy certificate consumers without printing configuration secrets."""
 import difflib
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,9 @@ def scan(caddy, sing, candidate_caddy, candidate_sing, *exclude):
         if resolved in excluded or resolved in seen:
             continue
         # Backups do not consume certificates. Report files, not secret contents.
+        if re.fullmatch(r'(?:caddy\.jsonc|config\.json)-good-\d{8}', path.name):
+            print(f'INFO: historical config backup ignored: {path}', file=sys.stderr)
+            continue
         if any(marker in path.name for marker in ('.bak', '.old', '.before-', '.migration-')):
             continue
         seen.add(resolved)
