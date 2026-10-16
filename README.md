@@ -311,7 +311,9 @@ The same invocation also converts directory loading (`-C /etc/sing-box`) to:
 
 It works even when certificate paths are already correct. It requires the existing service to run as `www-data:www-data`, with a writable `/var/lib/sing-box`; use the identity converter below first if needed. Additional JSON/JSONC files in directory mode are listed and block conversion so effective inputs are not silently discarded. Move confirmed historical JSON inputs outside the directory before retrying.
 
-Before changing live files, it checks certificate/key readability and validates the candidate as `www-data`. A dedicated `/etc/systemd/system/sing-box.service.d/zzzz-single-file.conf` sets the identity and single-file ExecStart; the main unit, other drop-ins and enabled state are retained. This does not replace a local main unit with a vendor unit or install/upgrade packages. Originally active services restart automatically; inactive services stay stopped. Configuration and the managed drop-in are backed up under `/root/sing-box-migration-backup/`; a switching/restart failure restores them and attempts to restore the previous runtime. Already-correct runs validate and skip changes/restart. `/home/tls` and Caddy are untouched.
+Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes the same `/etc/systemd/system/sing-box.service.d/override.conf` as the installer and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0750), state/log ownership and state-directory permissions to match the installer. It reenables and starts/restarts the service, including previously disabled/inactive services.
+
+Configuration, the old local unit, drop-ins and permission metadata are backed up under `/root/sing-box-migration-backup/`. A switching/restart failure restores them and attempts to restore the previous enabled/active state. Already-correct enabled/active installations validate and skip changes/restart. It neither installs/upgrades packages nor modifies Caddy or `/home/tls`. Missing vendor units/certificates or conflicting unrelated drop-ins cause failure, rather than a success report for an incomplete layout.
 
 ### 4. Install/standardize sing-box when needed
 
@@ -451,7 +453,8 @@ Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy
   `/root/www-data-conversion.*`; failed conversion attempts restore them and
   restart previously active services. Newly created empty directories may remain.
 - Sing-box normalization validates a candidate before changing live configuration/startup.
-  It restarts previously active services and restores configuration/startup on failure.
+  It enables and starts/restarts the normalized service; on failure it restores
+  the prior configuration, local unit, drop-ins, permissions and service state.
 
 Validation: `bash tests/test_caddy_update.sh`; `bash -n caddy/*.sh` (run each file
 individually). These checks do not replace installation/upgrade testing on Debian.
