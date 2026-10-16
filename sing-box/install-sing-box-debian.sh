@@ -128,6 +128,7 @@ setup_service(){
 [Service]
 User=www-data
 Group=www-data
+StateDirectoryMode=0750
 ExecStart=
 ExecStart=/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
 EOF

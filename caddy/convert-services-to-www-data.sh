@@ -83,6 +83,7 @@ cat >/etc/systemd/system/sing-box.service.d/override.conf <<'EOF'
 [Service]
 User=www-data
 Group=www-data
+StateDirectoryMode=0750
 EOF
 
 log "Updating ownership"
