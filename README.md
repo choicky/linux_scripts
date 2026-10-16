@@ -216,6 +216,7 @@ The vendor systemd unit remains unchanged. The installer writes
 The sole production configuration is `/etc/sing-box/config.json`
 (`root:www-data`, 0640). Other JSON files in `/etc/sing-box/`, including old,
 test and backup configurations, are not automatically loaded by systemd.
+The service override sets `StateDirectoryMode=0750`, matching the directory permissions prepared by the installer and preventing systemd from resetting them on startup. Installation, identity conversion and normalization all use this setting.
 Existing state/cache files under `/var/lib/sing-box` are made writable by
 `www-data:www-data`.
 
