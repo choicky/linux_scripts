@@ -19,7 +19,7 @@ Personal Linux server administration and deployment scripts.
 - `caddy/migrate-caddy-debian.sh` — one-time migration from the old manual Caddy layout.
 - `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
-- `sing-box/migrate-caddy-cert-paths.sh` — migrate sing-box certificate/key paths from legacy Caddy storage to the standard Caddy storage.
+- `sing-box/migrate-caddy-cert-paths.sh` — migrate certificate paths and normalize existing sing-box startup to a single config file without reinstalling packages.
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
@@ -283,7 +283,7 @@ The script:
 
 Do not delete `/home/tls` after this step.
 
-### 3. Migrate sing-box certificate paths
+### 3. Normalize existing sing-box configuration and startup
 
 Run:
 
@@ -291,7 +291,7 @@ Run:
 bash sing-box/migrate-caddy-cert-paths.sh
 ```
 
-This helper only rewrites `certificate_path` and `key_path` entries from:
+This helper rewrites `certificate_path` and `key_path` entries from:
 
 ```text
 /home/tls/...
@@ -303,7 +303,15 @@ to:
 /var/lib/caddy/.local/share/caddy/...
 ```
 
-Before editing, it verifies that every corresponding certificate/key already exists in the new Caddy storage. It creates a timestamped backup of `/etc/sing-box/config.json`, validates the modified configuration as `www-data`, and restores the backup if validation fails. It does not remove `/home/tls`.
+The same invocation also converts directory loading (`-C /etc/sing-box`) to:
+
+```text
+/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
+```
+
+It works even when certificate paths are already correct. It requires the existing service to run as `www-data:www-data`, with a writable `/var/lib/sing-box`; use the identity converter below first if needed. Additional JSON/JSONC files in directory mode are listed and block conversion so effective inputs are not silently discarded. Move confirmed historical JSON inputs outside the directory before retrying.
+
+Before changing live files, it checks certificate/key readability and validates the candidate as `www-data`. A dedicated `/etc/systemd/system/sing-box.service.d/zzzz-single-file.conf` sets the identity and single-file ExecStart; the main unit, other drop-ins and enabled state are retained. This does not replace a local main unit with a vendor unit or install/upgrade packages. Originally active services restart automatically; inactive services stay stopped. Configuration and the managed drop-in are backed up under `/root/sing-box-migration-backup/`; a switching/restart failure restores them and attempts to restore the previous runtime. Already-correct runs validate and skip changes/restart. `/home/tls` and Caddy are untouched.
 
 ### 4. Install/standardize sing-box when needed
 
@@ -406,7 +414,7 @@ After a migration, keep these rollback materials until the server has been stabl
 
 - `/home/tls`
 - `/root/caddy-migration-backup/<timestamp>`
-- timestamped `/etc/sing-box/config.json.before-caddy-storage-migration-*` backups
+- `/root/sing-box-migration-backup/*` configuration/startup backups (older versions used `/etc/sing-box/config.json.before-caddy-storage-migration-*`)
 
 Do not remove `/home/tls` while any service or configuration still references it.
 
@@ -442,8 +450,8 @@ Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy
 - Identity conversion retains override/permission backups under
   `/root/www-data-conversion.*`; failed conversion attempts restore them and
   restart previously active services. Newly created empty directories may remain.
-- Certificate-path migration validates a staged candidate before atomically
-  replacing sing-box configuration. It does not restart sing-box automatically.
+- Sing-box normalization validates a candidate before changing live configuration/startup.
+  It restarts previously active services and restores configuration/startup on failure.
 
 Validation: `bash tests/test_caddy_update.sh`; `bash -n caddy/*.sh` (run each file
 individually). These checks do not replace installation/upgrade testing on Debian.
