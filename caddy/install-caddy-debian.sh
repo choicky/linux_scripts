@@ -12,8 +12,6 @@ readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
 NO_START=false
-PREPARE_ONLY=""
-PREPARED_DIR=""
 BUILD_DIR=""
 SERVICE_TOUCHED=false
 RUNTIME_READY=false
@@ -42,25 +40,9 @@ trap cleanup EXIT
 
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
-usage(){ printf 'Usage: %s [--no-start] [--prepare-only DIR | --prepared-dir DIR]\n' "$0"; }
+usage(){ printf 'Usage: %s [--no-start]\n' "$0"; }
 
-parse_args(){
-  while (( $# )); do
-    case "$1" in
-      --no-start) NO_START=true;;
-      --prepare-only|--prepared-dir)
-        (( $# >= 2 )) || die "Missing directory for $1"
-        [[ "$2" == /* ]] || die "Preparation directory must be absolute."
-        if [[ "$1" == --prepare-only ]]; then PREPARE_ONLY="$2"; else PREPARED_DIR="$2"; fi
-        shift;;
-      -h|--help) usage; exit 0;;
-      *) usage >&2; die "Unknown option: $1";;
-    esac
-    shift
-  done
-  [[ -z "$PREPARE_ONLY" || -z "$PREPARED_DIR" ]] || die "Preparation options are mutually exclusive."
-}
-
+parse_args(){ while (( $# )); do case "$1" in --no-start) NO_START=true;; -h|--help) usage; exit 0;; *) usage >&2; die "Unknown option: $1";; esac; shift; done; }
 
 preflight(){
   [[ ${EUID} -eq 0 ]] || die "Run this script as root."
@@ -69,7 +51,7 @@ preflight(){
   case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
-  [[ -n "$PREPARE_ONLY" || ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
+  [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture: $(dpkg --print-architecture). Only amd64 and arm64 are provided.";; esac
   case "$(systemctl is-enabled caddy 2>/dev/null || true)" in
     masked|masked-runtime) WAS_MASKED=true;;
@@ -101,9 +83,7 @@ install_caddy_package(){
   fi
   SERVICE_TOUCHED=true
   systemctl mask caddy >/dev/null
-  local -a download_policy=()
-  [[ -z "$PREPARED_DIR" ]] || download_policy+=(--no-download)
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "${download_policy[@]}" -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
   systemctl stop caddy
   systemctl disable caddy >/dev/null 2>&1 || true
   install -m 0755 "$BUILD_DIR/caddy-linux-${ARCH}" "$CADDY_CUSTOM"
@@ -127,35 +107,7 @@ download_custom_caddy(){
   grep -Fq "$MODULE_CF_IP" <<<"$modules" || die "Missing caddy-cloudflare-ip."
   grep -Fq 'caddy.adapters.jsonc github.com/caddyserver/caddy/v2' <<<"$modules" || die "Missing built-in JSONC adapter."
   log "Custom binary verified; preparing the exact APT package before stopping Caddy"
-  apt-get install --download-only --reinstall -y "caddy=$PACKAGE_VERSION"
-}
-
-save_prepared(){
-  [[ ! -e "$PREPARE_ONLY" ]] || die "Preparation destination already exists: $PREPARE_ONLY"
-  install -d -m 0700 "$PREPARE_ONLY"
-  install -m 0755 "$BUILD_DIR/caddy-linux-${ARCH}" "$PREPARE_ONLY/caddy-linux-${ARCH}"
-  cp "$BUILD_DIR/SHA256SUMS" "$PREPARE_ONLY/SHA256SUMS"
-  printf '%s\n' "$PACKAGE_VERSION" > "$PREPARE_ONLY/package-version"
-  printf '%s\n' "$ARCH" > "$PREPARE_ONLY/architecture"
-  log "Prepared installation resources; running Caddy was not stopped."
-}
-
-load_prepared(){
-  [[ -d "$PREPARED_DIR" && ! -L "$PREPARED_DIR" ]] || die "Invalid prepared directory."
-  [[ "$(stat -c %u "$PREPARED_DIR")" == 0 && "$(stat -c %a "$PREPARED_DIR")" == 700 ]] || die "Prepared directory must be root-owned, mode 0700."
-  PACKAGE_VERSION="$(cat "$PREPARED_DIR/package-version")"
-  [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid prepared package version."
-  [[ "$(cat "$PREPARED_DIR/architecture")" == "$ARCH" ]] || die "Prepared architecture mismatch."
-  local asset="caddy-linux-${ARCH}" modules
-  # Recheck the local bundle immediately before installation.
-  (cd "$PREPARED_DIR" && grep -E "[[:space:]]+${asset}$" SHA256SUMS | sha256sum -c -) || die "Prepared checksum failed."
-  [[ "$("$PREPARED_DIR/$asset" version | awk '{print $1}')" == "v$PACKAGE_VERSION" ]] || die "Prepared version mismatch."
-  modules="$("$PREPARED_DIR/$asset" list-modules --packages)"
-  grep -Fq "$MODULE_L4" <<<"$modules" || die "Missing caddy-l4."
-  grep -Fq "$MODULE_CF_IP" <<<"$modules" || die "Missing Cloudflare IP module."
-  grep -Fq 'caddy.adapters.jsonc github.com/caddyserver/caddy/v2' <<<"$modules" || die "Missing JSONC adapter."
-  BUILD_DIR="$(mktemp -d)"
-  install -m 0755 "$PREPARED_DIR/$asset" "$BUILD_DIR/$asset"
+  apt-get install --download-only -y "caddy=$PACKAGE_VERSION"
 }
 
 setup_custom_binary(){
@@ -172,7 +124,6 @@ setup_custom_binary(){
   fi
 
   [[ -x "$CADDY_DEFAULT" && -x "$CADDY_CUSTOM" ]] || die "Caddy binaries are incomplete."
-  [[ "$("$CADDY_DEFAULT" version | awk '{print $1}')" == "v$PACKAGE_VERSION" ]] || die "Installed APT core version does not match prepared version."
   ln -sfn "$CADDY_CUSTOM" /usr/bin/caddy
   [[ "$(readlink -f /usr/bin/caddy)" == "$CADDY_CUSTOM" ]] || die "Custom Caddy is not selected."
 }
@@ -233,24 +184,5 @@ start_caddy(){
   systemctl is-active --quiet caddy || die "Caddy is not active."
 }
 
-main(){
-  parse_args "$@"
-  preflight
-  if [[ -n "$PREPARED_DIR" ]]; then
-    load_prepared
-  else
-    install_caddy
-    download_custom_caddy
-  fi
-  if [[ -n "$PREPARE_ONLY" ]]; then save_prepared; return 0; fi
-  install_caddy_package
-  setup_custom_binary
-  setup_service
-  prepare_paths
-  RUNTIME_READY=true
-  validate_installation
-  start_caddy
-  printf '\nCaddy installation completed.\n'
-  /usr/bin/caddy version
-}
+main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; setup_service; prepare_paths; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
 main "$@"
