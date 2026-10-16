@@ -40,4 +40,30 @@ runuser() {{ return 1; }}
         calls=self.run_case('touch "$CONFIG"; SERVICE_TOUCHED=true; RUNTIME_READY=true; validate_installation',1)
         self.assertIn('stop caddy',calls);self.assertIn('unmask caddy',calls);self.assertNotIn('restart caddy',calls)
 
+    def test_prepare_only_never_installs_or_stops_service(self):
+        calls=self.run_case('''
+preflight(){ :; }
+install_caddy(){ :; }
+download_custom_caddy(){ :; }
+save_prepared(){ :; }
+install_caddy_package(){ systemctl stop caddy; exit 99; }
+main --prepare-only /unused
+''')
+        self.assertEqual(calls, '')
+    def test_prepared_install_does_not_redownload(self):
+        calls=self.run_case('''
+preflight(){ :; }
+load_prepared(){ :; }
+install_caddy(){ exit 99; }
+download_custom_caddy(){ exit 99; }
+install_caddy_package(){ :; }
+setup_custom_binary(){ :; }
+setup_service(){ :; }
+prepare_paths(){ :; }
+validate_installation(){ :; }
+start_caddy(){ :; }
+main --prepared-dir /unused --no-start
+''')
+        self.assertEqual(calls, '')
+
 if __name__=='__main__':unittest.main()
