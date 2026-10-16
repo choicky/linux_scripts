@@ -16,11 +16,12 @@ Personal Linux server administration and deployment scripts.
 
 - `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary.
 - `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified.
-- `caddy/migrate-caddy-debian.sh` — one-time migration from the old manual Caddy layout.
+- `caddy/migrate-caddy-debian.sh` — inspect/reconcile an existing Caddy layout and migrate Caddy/sing-box certificate storage together.
+- `caddy/Standardize-Caddy.ps1` / `standardize-caddy.bat` — Windows batch entry points for inspection or migration over existing SSH aliases.
 - `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
 - `sing-box/migrate-caddy-cert-paths.sh` — migrate sing-box certificate/key paths from legacy Caddy storage to the standard Caddy storage.
-- `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
+- `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while preserving the existing password-authentication policy by default.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
 
@@ -235,144 +236,123 @@ service to prevent restart loops, then prints status and recent journal entries.
 Earlier installation failures also leave the service stopped and masked; fix
 the reported cause and rerun.
 
-## One-time migration of an old server
+## Standardize existing VPS installations
 
-This procedure is for servers using the legacy layout:
+Target: official Caddy Stable APT package; matching custom binary selected using
+`dpkg-divert`; vendor service plus a `www-data:www-data` drop-in; configuration
+`/etc/caddy/caddy.jsonc`; certificate storage
+`/var/lib/caddy/.local/share/caddy`. Existing sing-box keeps its executable,
+service and proxy settings; only `certificate_path` / `key_path` references
+under `/home/tls/` are rewritten.
 
-```text
-Caddy binary:  /usr/local/bin/caddy
-Caddy unit:    /etc/systemd/system/caddy.service
-Caddy config:  /etc/caddy/caddy.jsonc
-Caddy storage: /home/tls
-```
-
-The migration intentionally keeps `/home/tls` and a timestamped backup so rollback remains possible.
-
-### 1. Update this repository
+Update or clone this repository, then inspect on the server as root:
 
 ```bash
 cd /root/linux_scripts
 git pull --ff-only
-```
-
-If the repository is not present yet:
-
-```bash
-git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
-cd /root/linux_scripts
-```
-
-### 2. Migrate Caddy
-
-```bash
 bash caddy/migrate-caddy-debian.sh
 ```
 
-The script:
-
-1. verifies the expected old layout;
-2. backs up the old Caddy binary, unit and configuration under `/root/caddy-migration-backup/<timestamp>`;
-3. retains `/home/tls` in place;
-4. installs Caddy Stable from the official APT repository;
-5. downloads and verifies the matching prebuilt custom Caddy release;
-6. registers the stock/custom binaries using dpkg-divert;
-7. copies Caddy storage to `/var/lib/caddy/.local/share/caddy`;
-8. rewrites only Caddy's FileStorage root;
-9. validates and starts Caddy;
-10. reports any remaining sing-box references to `/home/tls`.
-
-Do not delete `/home/tls` after this step.
-
-### 3. Migrate sing-box certificate paths
-
-Run:
+If absent, clone first:
 
 ```bash
-bash sing-box/migrate-caddy-cert-paths.sh
+git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
 ```
 
-This helper only rewrites `certificate_path` and `key_path` entries from:
-
-```text
-/home/tls/...
-```
-
-to:
-
-```text
-/var/lib/caddy/.local/share/caddy/...
-```
-
-Before editing, it verifies that every corresponding certificate/key already exists in the new Caddy storage. It creates a timestamped backup of `/etc/sing-box/config.json`, validates the modified configuration as `www-data`, and restores the backup if validation fails. It does not remove `/home/tls`.
-
-### 4. Install/standardize sing-box when needed
-
-For servers that do not yet use the official Stable APT package, run:
+Default mode does not stop services or install packages. To execute:
 
 ```bash
-bash sing-box/install-sing-box-debian.sh
+bash caddy/migrate-caddy-debian.sh --apply
 ```
 
-The installer uses the official SagerNet APT repository and installs `sing-box`, never `sing-box-beta`. It retains the vendor systemd unit and uses a drop-in to run as `www-data:www-data` with only `/etc/sing-box/config.json`. See the installation and recovery options above.
+The script handles these states automatically:
 
-If the server already has the correct official Stable package and service, do not reinstall it merely for the certificate-path migration.
+| Current state | Action with `--apply` |
+| --- | --- |
+| Standard binaries/service, standard storage and sing-box paths | Validate; no restart |
+| Standard binaries/service, Caddy and/or sing-box still using `/home/tls` | Reconcile storage and certificate references; no package installation |
+| Manual or incomplete package layout, supported executable/service | Prepare package/custom binary first, then install standard layout and reconcile storage |
 
-### 5. Compatibility conversion for previously migrated servers
+`--storage-only` additionally requires an already standard installation; it may
+be combined with `--apply`. Fresh installations still use the installer.
 
-Servers that were migrated with an earlier version of these scripts may still run Caddy and/or sing-box as another service account. For those servers only:
+Preflight requires Debian 12/13, amd64/arm64 for package installation, Python 3,
+`flock`, an active Caddy JSONC service running as `www-data:www-data`, and explicit
+filesystem storage at `/home/tls` or the target path. Supported Caddy executable
+paths are `/usr/local/bin/caddy`, `/usr/bin/caddy`, and `/usr/bin/caddy.custom`.
+If sing-box configuration exists, its service must use that single config file
+and the `www-data:www-data` identity. Unexpected layouts stop for inspection;
+the script does not guess arbitrary paths or convert service accounts.
 
-```bash
-bash caddy/convert-services-to-www-data.sh
+Migration behavior:
+
+1. Stage comment-preserving JSONC edits; other configuration fields are retained.
+2. For manual layouts, download/verify the matching custom core and pre-download
+   the exact APT package while production Caddy is still running. Installer
+   `--prepare-only DIR` creates the private bundle; `--prepared-dir DIR --no-start`
+   rechecks and consumes it with APT `--no-download`. The exact Caddy package is
+   reinstalled even when already recorded as installed, so a manually replaced
+   `/usr/bin/caddy` cannot be mistaken for the official stock core. These options
+   are migration plumbing, not the normal install/upgrade interface.
+3. Back up configs, Caddy executable entries, unit and drop-ins under
+   `/root/caddy-migration-backup/<timestamp-pid>` before switching.
+4. Stop Caddy and existing sing-box during the switch. If copying `/home/tls`,
+   retain it unchanged; move any existing target storage to the sibling
+   `caddy.before-migration-<timestamp-pid>` before copying the active source.
+5. Verify destination certificate/key readability as `www-data`; validate both
+   staged configurations as `www-data`; only then replace live configs.
+6. Restart Caddy and previously active sing-box, preserve Caddy boot-enable
+   state and previously inactive sing-box state, and check service status and
+   Caddy identity/entry point. Services are briefly interrupted.
+7. On failure after the switch starts, attempt to restore configs, the previous
+   destination storage and the old runtime. Package/repository/diversion changes
+   are not rolled back; inspect reported restoration failures before retrying.
+   A concurrent migration is rejected using a host-local lock.
+
+Do not remove old storage or backups until websites and actual proxy nodes have
+been tested. Config validation/service activity does not prove end-to-end health.
+Do not restore an old JSONC afterward without preserving the standardized storage
+paths, or the next certificate renewal may write to a different directory.
+
+### Windows batch entry
+
+Keep `Standardize-Caddy.ps1` and `standardize-caddy.bat` in the same directory.
+The remote host needs `git`; SSH aliases and interactive sudo are reused. Each
+host gets a temporary repository checkout, leaving existing checkouts untouched.
+The default target list includes HK, SG, JP–JP4, KR–KR3, US–US7, TR and SZ once
+each; aliases such as `oraclekr3` / `alisz` are not duplicated.
+
+```powershell
+# Inspect all hosts; double-clicking the BAT does the same.
+& .\Standardize-Caddy.ps1
+
+# Migrate KR3 first.
+& .\Standardize-Caddy.ps1 -Targets @('kr3') -Apply
+
+# Then migrate all hosts; already compliant ones are validated and skipped.
+& .\Standardize-Caddy.ps1 -Apply
 ```
 
-This changes both services to `www-data:www-data`, fixes Caddy/sing-box state and log ownership, validates both configurations as `www-data`, and restarts the services.
+The BAT accepts `-Apply` too. To use one fixed revision across a batch, pass
+`-Revision <full-commit-sha>`; otherwise each host checks out current `main` and
+prints the resolved commit. A failed/closed SSH connection is reported separately
+from a successful run; reconnect and inspect services before retrying.
 
-A server migrated from scratch with the current scripts normally does not need this compatibility step if both services already show the expected runtime identities.
+### Other helpers
 
-### 6. Final verification
+- `sing-box/migrate-caddy-cert-paths.sh` remains a standalone path-only helper for
+  cases where Caddy storage has already been migrated. It does not restart
+  sing-box; normally the integrated migration above handles both components.
+- `caddy/convert-services-to-www-data.sh` is only for an older installation using
+  other service accounts. It changes **both** identities/permissions, validates
+  configs and restarts them; it is not a storage or package migration. It retains
+  override/permission backups under `/root/www-data-conversion.*` and attempts
+  restoration on failure; newly created empty directories may remain.
 
-```bash
-echo '=== services ==='
-systemctl is-active caddy sing-box
-
-echo
-echo '=== identities ==='
-systemctl show caddy -p User -p Group
-systemctl show sing-box -p User -p Group
-
-echo
-echo '=== processes ==='
-ps -eo user,group,pid,comm,args | grep -E '[c]addy|[s]ing-box|php-fpm'
-
-echo
-echo '=== binaries ==='
-ls -l /usr/bin/caddy /usr/bin/caddy.default /usr/bin/caddy.custom
-/usr/bin/caddy version
-
-echo
-echo '=== old TLS references ==='
-grep -Rni '/home/tls' /etc/caddy /etc/sing-box 2>/dev/null || true
-
-echo
-echo '=== listeners ==='
-ss -lntup | grep -E ':(80|443|8443)\\b'
-
-echo
-echo '=== recent warnings/errors ==='
-journalctl -u caddy --since '-3 minutes' --no-pager -p warning
-journalctl -u sing-box --since '-3 minutes' --no-pager -p warning
-```
-
-Expected service identities:
-
-```text
-caddy:    User=www-data  Group=www-data
-sing-box: User=www-data  Group=www-data
-```
-
-Typical listener layout used by these servers is Caddy on TCP 80/443/8443 and sing-box on UDP 443. Caddy may also listen on UDP 8443 for HTTP/3 when configured.
-
-Finally test the actual proxy nodes and web/PHP applications. Service status and configuration validation do not replace an end-to-end test.
+Validation: `python3 tests/test_caddy_migration.py` covers JSONC edits, idempotency,
+manual-layout preparation ordering, successful storage migration and rollback in
+an isolated filesystem with mocked service/package commands. Installer lifecycle
+checks remain in `tests/test_caddy_install.py`. No live Debian migration is implied.
 
 ## Routine Caddy upgrade
 
@@ -387,7 +367,7 @@ bash caddy/update-caddy-debian.sh
 The updater deliberately prepares the custom binary **before** changing the APT package. It:
 
 1. refreshes APT metadata and reads the Caddy Stable candidate version;
-2. exits without restarting Caddy when the installed APT version is already current;
+2. exits without restarting only when both installed stock and custom versions match the candidate;
 3. downloads the exactly matching `caddy-linux-amd64` or `caddy-linux-arm64` release and `SHA256SUMS` from `choicky/caddy-custom-build`;
 4. verifies SHA256, version, `caddy-l4`, `caddy-cloudflare-ip`, and built-in JSONC support;
 5. validates the current JSONC configuration with the new custom binary as `www-data`;
@@ -400,50 +380,8 @@ If the matching custom GitHub Release does not exist yet, the script stops **bef
 
 Do not use `install-caddy-debian.sh` as the normal upgrade command once the standard layout is installed.
 
-## Backups and old TLS storage
 
-After a migration, keep these rollback materials until the server has been stable and its proxy/web services have been tested:
-
-- `/home/tls`
-- `/root/caddy-migration-backup/<timestamp>`
-- timestamped `/etc/sing-box/config.json.before-caddy-storage-migration-*` backups
-
-Do not remove `/home/tls` while any service or configuration still references it.
-
-## Already migrated servers
-
-For servers such as those migrated with an earlier script revision, first update the repository and then run the compatibility conversion only if the effective service users are not already correct:
-
-```bash
-cd /root/linux_scripts
-git pull --ff-only
-systemctl show caddy -p User -p Group
-systemctl show sing-box -p User -p Group
-```
-
-If required:
-
-```bash
-bash caddy/convert-services-to-www-data.sh
-```
-
-Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy + /home/tls` layout has already been migrated.
-
-### Caddy failure-handling fixes (2026-10-16)
-
-- Install/update verify the matching custom release before stopping Caddy. A missing
-  release aborts; no automatic fallback to an older or stock binary is performed.
-- Update pre-downloads the exact APT package, validates the custom core as
-  `www-data`, and preserves the previous active/enabled state. Runtime rollback
-  restores the custom binary and service state, **not the APT package version**;
-  rerun the updater after resolving the failure to reconcile package/core versions.
-- Legacy migration retains existing service drop-ins for rollback and stops the
-  new process before restoring the old unit/configuration.
-- Identity conversion retains override/permission backups under
-  `/root/www-data-conversion.*`; failed conversion attempts restore them and
-  restart previously active services. Newly created empty directories may remain.
-- Certificate-path migration validates a staged candidate before atomically
-  replacing sing-box configuration. It does not restart sing-box automatically.
-
-Validation: `bash tests/test_caddy_update.sh`; `bash -n caddy/*.sh` (run each file
-individually). These checks do not replace installation/upgrade testing on Debian.
+Runtime rollback restores the old custom binary and service state, not the APT
+package version. After resolving a failure, rerun the updater to reconcile them.
+Update regression checks: `bash tests/test_caddy_update.sh`. These isolated checks
+do not replace Debian installation/upgrade testing.
