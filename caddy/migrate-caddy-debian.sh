@@ -21,6 +21,7 @@ CADDY_ENABLED=false
 OLD_NEW=""
 CADDY_TOUCHED=false
 SING_TOUCHED=false
+RESULT_CODE=0
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 usage(){ echo "Usage: $0 [--apply] [--storage-only]"; }
@@ -72,6 +73,11 @@ rollback(){
   [[ -z "$CSTAGE" ]] || rm -f -- "$CSTAGE"
   [[ -z "$SSTAGE" ]] || rm -f -- "$SSTAGE"
   [[ -z "$WORK" ]] || rm -rf -- "$WORK"
+  # Reserve 3/4 exclusively for intentional SKIPPED/BLOCKED results.
+  # Failed commands may return either code, including after runtime rollback.
+  if [[ "$rc" == 3 || "$rc" == 4 ]]; then
+    [[ "$RESULT_CODE" == "$rc" && "$CHANGED" == false ]] || rc=1
+  fi
   exit "$rc"
 }
 trap 'rollback $?' EXIT
@@ -155,6 +161,7 @@ if [[ "$STANDARD" == false ]]; then
   PLAN_EXCLUDES+=(/etc/systemd/system/caddy.service.d/override.conf)
 fi
 if ! scan_legacy "$WORK/caddy.jsonc" "$WORK/sing-box.json" "${PLAN_EXCLUDES[@]}"; then
+  RESULT_CODE=4
   echo 'CADDY_MIGRATION_RESULT=BLOCKED'
   exit 4
 fi
@@ -162,6 +169,7 @@ if [[ "$STANDARD" == true && "$SOURCE" == "$NEW" && "$SING_CHANGES" == 0 ]]; the
   runuser -u www-data -- env HOME=/var/lib/caddy "$CORE" validate --config "$CONFIG" --adapter jsonc
   [[ "$SING_PRESENT" == false ]] || runuser -u www-data -- "$SING_CORE" -D /var/lib/sing-box check -c "$SING"
   log 'Already standardized; no files changed and no services restarted.'
+  RESULT_CODE=3
   echo 'CADDY_MIGRATION_RESULT=SKIPPED'
   exit 3
 fi

@@ -9,21 +9,25 @@ ROOTS = ['/etc/caddy', '/etc/sing-box', '/etc/systemd/system',
 
 
 def scan(caddy, sing, candidate_caddy, candidate_sing, *exclude):
-    replacements = {Path(caddy): Path(candidate_caddy), Path(sing): Path(candidate_sing)}
+    replacements = {Path(caddy).resolve(): Path(candidate_caddy),
+                    Path(sing).resolve(): Path(candidate_sing)}
     files = set(replacements)
     for root in ROOTS:
         directory = Path(root)
         if directory.exists():
             files.update(p for p in directory.rglob('*') if p.is_file())
-    excluded = {Path(p) for p in exclude}
+    excluded = {Path(p).resolve() for p in exclude}
+    seen = set()
     findings = []
     for path in sorted(files):
-        if path in excluded:
+        resolved = path.resolve()
+        if resolved in excluded or resolved in seen:
             continue
         # Backups do not consume certificates. Report files, not secret contents.
         if any(marker in path.name for marker in ('.bak', '.old', '.before-', '.migration-')):
             continue
-        actual = replacements.get(path, path)
+        seen.add(resolved)
+        actual = replacements.get(resolved, path)
         if not actual.exists():
             continue
         for line, content in enumerate(actual.read_bytes().splitlines(), 1):

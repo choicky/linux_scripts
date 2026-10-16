@@ -66,8 +66,28 @@ class ConfigTests(unittest.TestCase):
                 config.prepare(d/'c', d/'s', d/'co', d/'so')
 
 
+class ScanTests(unittest.TestCase):
+    def test_symlinks_respect_exclusions_and_deduplicate_external_targets(self):
+        spec=importlib.util.spec_from_file_location('scanner', ROOT/'caddy/scan-legacy-paths.py')
+        scanner=importlib.util.module_from_spec(spec); spec.loader.exec_module(scanner)
+        with tempfile.TemporaryDirectory() as tmp:
+            d=Path(tmp); root=d/'units'; root.mkdir()
+            target=root/'caddy.service'; target.write_text('ReadWritePaths=/home/tls\n')
+            (root/'enabled.service').symlink_to(target)
+            external=d/'outside.service'; external.write_text('ReadWritePaths=/home/tls\n')
+            (root/'outside-a.service').symlink_to(external)
+            (root/'outside-b.service').symlink_to(external)
+            scanner.ROOTS=[str(root)]
+            missing=d/'missing'
+            findings=scanner.scan(missing, missing, missing, missing, target)
+            self.assertEqual(len(findings),1)
+            self.assertIn('outside-',findings[0])
+            findings=scanner.scan(missing, missing, missing, missing)
+            self.assertEqual(len(findings),2)
+
+
 class LifecycleTests(unittest.TestCase):
-    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False):
+    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False, failure_code=9):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp); fs = d/'fs'; scripts = d/'scripts'; scripts.mkdir()
             for p in ['etc/caddy','etc/sing-box','etc/systemd/system/caddy.service.d','usr/bin','usr/lib/systemd/system','home/tls/certificates','var/lib/caddy/.local/share/caddy/certificates','var/lib/sing-box','run/lock','tmp']:
@@ -90,6 +110,10 @@ class LifecycleTests(unittest.TestCase):
             before = c.read_bytes(), s.read_bytes()
             fragment=fs/('etc/systemd/system/caddy.service' if local_unit else 'usr/lib/systemd/system/caddy.service')
             fragment.write_text('[Service]\nUser=www-data\n' + ('ReadWritePaths=/home/tls\n' if local_unit else ''))
+            if local_unit:
+                wants=fs/'etc/systemd/system/multi-user.target.wants'
+                wants.mkdir()
+                (wants/'caddy.service').symlink_to(fragment)
             if retained_dropin:
                 (fs/'etc/systemd/system/caddy.service.d/extra.conf').write_text('[Service]\nReadWritePaths=/home/tls\n')
             for name in ['caddy.custom','caddy.default','sing-box']:
@@ -133,7 +157,7 @@ fi
 exit 0
 '''
             runuser='#!/bin/bash\nwhile [[ "$1" != -- ]]; do shift; done\nshift\n'
-            if fail:runuser+='if [[ "$*" == *"check -c"* ]]; then exit 9; fi\n'
+            if fail:runuser+=f'if [[ "$*" == *"check -c"* ]]; then exit {failure_code}; fi\n'
             runuser+='"$@"\n'
             install='#!/bin/bash\na=(); while (( $# )); do case "$1" in -o|-g) shift 2;; *) a+=("$1"); shift;; esac; done\nexec /usr/bin/install "${a[@]}"\n'
             cmds={'install':install,'systemctl':systemctl,'runuser':runuser,'getent':'#!/bin/sh\nexit 0\n','chown':'#!/bin/sh\nexit 0\n','sleep':'#!/bin/sh\nexit 0\n','dpkg-query':'#!/bin/sh\necho "install ok installed"\n','dpkg-divert':f'#!/bin/sh\necho "local diversion to {fs}/usr/bin/caddy.default"\n'}
@@ -142,7 +166,7 @@ exit 0
             script=scripts/'migrate-caddy-debian.sh';script.write_text(src)
             env=dict(os.environ,PATH=str(bins)+':'+os.environ['PATH'])
             r=subprocess.run(['bash',str(script)]+([] if plan else ['--apply']),env=env,text=True,capture_output=True)
-            self.assertEqual(r.returncode, 4 if residual or retained_dropin else 8 if install_fail else 9 if fail else 3 if noop else 0, r.stdout+r.stderr)
+            self.assertEqual(r.returncode, 4 if residual or retained_dropin else 8 if install_fail else (1 if failure_code in (3,4) else failure_code) if fail else 3 if noop else 0, r.stdout+r.stderr)
             logs=calls.read_text()
             if fail or install_fail or residual or retained_dropin or plan or noop:
                 self.assertEqual((c.read_bytes(),s.read_bytes()),before)
@@ -173,6 +197,8 @@ exit 0
                 self.assertIn('config.json:1' if residual == 'main' else 'other.json:1',r.stderr)
             self.assertEqual((Path(old)/'certificates/a.crt').read_text(),'SOURCE CERT')
 
+    def test_failure_code_three_is_not_reported_as_skipped(self):self.exercise(fail=True,failure_code=3)
+    def test_failure_code_four_is_not_reported_as_blocked(self):self.exercise(fail=True,failure_code=4)
     def test_legacy_local_unit_is_excluded_then_removed(self):self.exercise(legacy=True,local_unit=True)
     def test_retained_dropin_still_blocks_migration(self):self.exercise(legacy=True,retained_dropin=True)
     def test_plan_with_residual_is_blocked(self):self.exercise(residual=True,plan=True)
