@@ -3,18 +3,21 @@
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 OLD = '/home/tls'
 NEW = '/var/lib/caddy/.local/share/caddy'
-TOKEN = re.compile(r'\s+|//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s{}\[\]:,]+')
+TOKEN = re.compile(r'\s+|//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s{}\[\]:,/]+|/')
 
 
 def document(path):
     text = Path(path).read_text(encoding='utf-8-sig')
     tokens = [m for m in TOKEN.finditer(text)
               if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
-    clean = ''.join(m[0] for m in tokens)
+    tokens = [m for i, m in enumerate(tokens)
+              if not (m[0] == ',' and i + 1 < len(tokens) and tokens[i+1][0] in ('}', ']'))]
+    clean = ' '.join(m[0] for m in tokens)
     value = json.loads(clean)
     spans = {}
     index = 0
@@ -69,7 +72,6 @@ def prepare(caddy, sing, out_caddy, out_sing):
                     replacements.append((a, b, json.dumps(val)))
                 if val.startswith(NEW + '/'):
                     # Paths are configuration input, but must stay inside storage.
-                    Path(val).relative_to(NEW)
                     if '..' in Path(val).parts:
                         raise ValueError('Parent traversal in certificate path')
                     references.append(val)
@@ -88,7 +90,10 @@ def main():
     parser.add_argument('out_caddy')
     parser.add_argument('out_sing')
     args = parser.parse_args()
-    print(json.dumps(prepare(args.caddy, args.sing, args.out_caddy, args.out_sing)))
+    try:
+        print(json.dumps(prepare(args.caddy, args.sing, args.out_caddy, args.out_sing)))
+    except (ValueError, OSError, IndexError, KeyError) as exc:
+        parser.exit(2, f"Configuration preparation failed: {exc}\n")
 
 
 if __name__ == '__main__':

@@ -33,6 +33,23 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((d/'co').read_bytes(), (d/'co2').read_bytes())
             self.assertEqual((d/'so').read_bytes(), (d/'so2').read_bytes())
 
+    def test_jsonc_trailing_commas_and_adjacent_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d/'c').write_text('{"storage":{"module":"file_system","root":"/home/tls",},"n":1// c\n,"a":[1,2,],}')
+            config.prepare(d/'c', '-', d/'out', d/'unused')
+            _, value, _ = config.document(d/'out')
+            self.assertEqual(value['n'], 1)
+            self.assertEqual(value['a'], [1, 2])
+
+    def test_cli_invalid_json_has_readable_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp); (d/'c').write_text('{broken')
+            r=subprocess.run(['python3',str(ROOT/'caddy/migration-config.py'),str(d/'c'),'-',str(d/'out'),str(d/'unused')],text=True,capture_output=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn('Configuration preparation failed:', r.stderr)
+            self.assertNotIn('Traceback', r.stderr)
+
     def test_unknown_storage_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)/'c'
@@ -50,7 +67,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def exercise(self, fail=False, noop=False, plan=False, legacy=False):
+    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp); fs = d/'fs'; scripts = d/'scripts'; scripts.mkdir()
             for p in ['etc/caddy','etc/sing-box','etc/systemd/system/caddy.service.d','usr/bin','usr/lib/systemd/system','home/tls/certificates','var/lib/caddy/.local/share/caddy/certificates','var/lib/sing-box','run/lock','tmp']:
@@ -58,10 +75,18 @@ class LifecycleTests(unittest.TestCase):
             old = str(fs/'home/tls'); new = str(fs/'var/lib/caddy/.local/share/caddy')
             (Path(old)/'certificates/a.crt').write_text('SOURCE CERT')
             (Path(new)/'certificates/a.crt').write_text('PREVIOUS DESTINATION CERT')
-            source = new if noop else old
+            source = new if noop or path_only else old
             c = fs/'etc/caddy/caddy.jsonc'; s = fs/'etc/sing-box/config.json'
             c.write_text(json.dumps({'storage':{'module':'file_system','root':source}}))
             s.write_text(json.dumps({'inbounds':[{'tls':{'certificate_path':source+'/certificates/a.crt'}}]}))
+            if path_only:
+                s.write_text(s.read_text().replace(new,old))
+            if caddy_only:
+                s.write_text('{"inbounds":[]}')
+            if residual == 'main':
+                value=json.loads(s.read_text()); value['other']='/home/tls/extra.crt'; s.write_text(json.dumps(value))
+            elif residual:
+                (fs/'etc/sing-box/other.json').write_text('{"other":"/home/tls/extra.crt"}')
             before = c.read_bytes(), s.read_bytes()
             fragment=fs/'usr/lib/systemd/system/caddy.service'; fragment.write_text('[Service]\nUser=www-data\n')
             for name in ['caddy.custom','caddy.default','sing-box']:
@@ -69,6 +94,9 @@ class LifecycleTests(unittest.TestCase):
             (fs/'usr/bin/caddy').symlink_to(fs/'usr/bin/caddy.custom')
             helper=(ROOT/'caddy/migration-config.py').read_text().replace("OLD = '/home/tls'",f'OLD = {old!r}').replace("NEW = '/var/lib/caddy/.local/share/caddy'",f'NEW = {new!r}')
             (scripts/'migration-config.py').write_text(helper)
+            scanner=(ROOT/'caddy/scan-legacy-paths.py').read_text()
+            scanner=re.sub(r'/(?:usr/lib/|etc/)',lambda m:str(fs)+m[0],scanner)
+            (scripts/'scan-legacy-paths.py').write_text(scanner)
             (scripts/'install-caddy-debian.sh').write_text('exit 99\n')
             if legacy:
                 (fs/'usr/bin/caddy').unlink()
@@ -78,6 +106,9 @@ class LifecycleTests(unittest.TestCase):
 if [[ "$1" == --prepare-only ]]; then mkdir -p "$2"; exit 0; fi
 ln -sfn '{fs}/usr/bin/caddy.custom' '{fs}/usr/bin/caddy'
 '''
+                if install_fail:
+                    (fs/'usr/bin/caddy.default').unlink()
+                    installer += f"printf '#!/bin/sh\\nexit 0\\n' > '{fs}/usr/bin/caddy.default'\nchmod +x '{fs}/usr/bin/caddy.default'\nsystemctl mask caddy\nexit 8\n"
                 (scripts/'install-caddy-debian.sh').write_text(installer)
             src=(ROOT/'caddy/migrate-caddy-debian.sh').read_text()
             # All absolute production paths are remapped into this temp tree.
@@ -107,21 +138,39 @@ exit 0
             script=scripts/'migrate-caddy-debian.sh';script.write_text(src)
             env=dict(os.environ,PATH=str(bins)+':'+os.environ['PATH'])
             r=subprocess.run(['bash',str(script)]+([] if plan else ['--apply']),env=env,text=True,capture_output=True)
-            self.assertEqual(r.returncode, 9 if fail else 0, r.stdout+r.stderr)
+            self.assertEqual(r.returncode, 8 if install_fail else 1 if residual else 9 if fail else 0, r.stdout+r.stderr)
             logs=calls.read_text()
-            if fail or plan or noop:
+            if fail or install_fail or residual or plan or noop:
                 self.assertEqual((c.read_bytes(),s.read_bytes()),before)
             else:
-                self.assertIn(new,c.read_text());self.assertIn(new,s.read_text())
-                self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'SOURCE CERT')
+                self.assertIn(new,c.read_text())
+                if not caddy_only:self.assertIn(new,s.read_text())
+                if not path_only:self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'SOURCE CERT')
             if fail:
                 if legacy:
                     self.assertFalse((fs/'usr/bin/caddy').is_symlink())
                 self.assertEqual((Path(new)/'certificates/a.crt').read_text(),'PREVIOUS DESTINATION CERT')
                 self.assertIn('restart caddy',logs);self.assertIn('restart sing-box',logs)
-            if plan or noop:self.assertNotIn('stop ',logs);self.assertNotIn('restart ',logs)
+            if plan or noop or residual:self.assertNotIn('stop ',logs);self.assertNotIn('restart ',logs)
+            if path_only:
+                self.assertNotIn('stop caddy',logs);self.assertNotIn('restart caddy',logs)
+                self.assertIn('restart sing-box',logs)
+            if caddy_only:
+                self.assertNotIn('stop sing-box',logs);self.assertNotIn('restart sing-box',logs)
+            if install_fail:
+                self.assertTrue((fs/'usr/bin/caddy.default').is_file())
+                self.assertTrue((fs/'usr/bin/caddy.custom').is_file())
+                self.assertFalse((fs/'usr/bin/caddy').is_symlink())
+                self.assertIn('restart caddy',logs)
+            if residual:
+                self.assertIn('config.json:1' if residual == 'main' else 'other.json:1',r.stderr)
             self.assertEqual((Path(old)/'certificates/a.crt').read_text(),'SOURCE CERT')
 
+    def test_path_only_does_not_restart_caddy(self):self.exercise(path_only=True)
+    def test_caddy_only_does_not_restart_sing_box(self):self.exercise(caddy_only=True)
+    def test_non_certificate_key_in_main_blocks_apply(self):self.exercise(residual='main')
+    def test_non_certificate_legacy_reference_blocks_apply(self):self.exercise(residual=True)
+    def test_installer_failure_after_mask_preserves_package_core(self):self.exercise(legacy=True,install_fail=True)
     def test_legacy_binary_migration(self):self.exercise(legacy=True)
     def test_legacy_validation_failure_restores_binary(self):self.exercise(legacy=True,fail=True)
     def test_storage_only_success(self):self.exercise()

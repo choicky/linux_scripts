@@ -259,9 +259,14 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
 - Standard installation with legacy storage: copy storage and adapt both configs.
 - Manual installation: prepare and verify the matching custom core and pre-download
   the APT package before stopping services, then install the standard layout.
+- Plan prints a diff of changed path fields only, avoiding credential disclosure.
+  Legacy `/home/tls` references are scanned in Caddy/sing-box configs, systemd units,
+  nginx/haproxy configs and cron.d at plan time and after apply. Remaining references
+  block apply. Backup filenames are excluded; inspect custom consumers outside
+  these directories separately. Comments containing old paths can also trigger review.
 - Only Caddy `storage.root` and sing-box `certificate_path`/`key_path` are edited;
   comments and unrelated values remain. Both candidate configs are validated as
-  `www-data` before replacement. Active sing-box is restarted with Caddy.
+  `www-data` before replacement. Only affected active services are restarted.
 - Backups live under `/root/caddy-migration-backup`. `/home/tls` is retained.
   An existing destination tree is retained separately rather than merged.
 - Failure attempts to restore configs, storage, binaries and effective services;
@@ -272,22 +277,21 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
 ### Windows batch entry
 
 `caddy/Invoke-CaddyMigration.ps1` downloads one immutable repository revision and
-uploads the same scripts to each SSH alias. Default targets exclude SZ and duplicate
-aliases. Each host can prompt for its sudo password; failed hosts do not stop the
+uploads the same scripts to each SSH alias. Targets must be supplied explicitly using local SSH aliases; keep your fleet list locally. Each host can prompt for its sudo password; failed hosts do not stop the
 remaining hosts. Use a commit containing these scripts, not a moving branch name.
 
 ```powershell
 .\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets kr3
 .\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets kr3 -Apply
-# After checking KR3, apply to the default VPS list:
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Apply
+# After checking KR3, explicitly choose the next hosts:
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk,sg -Apply
 ```
 
 The separate `sing-box/migrate-caddy-cert-paths.sh` remains useful for path-only
 repairs after storage has already been migrated. The coordinated Caddy migrator
 now handles this adaptation itself; there is no additional helper step required.
 
-### 4. Install/standardize sing-box when needed
+### 1. Install/standardize sing-box when needed
 
 For servers that do not yet use the official Stable APT package, run:
 
@@ -299,7 +303,7 @@ The installer uses the official SagerNet APT repository and installs `sing-box`,
 
 If the server already has the correct official Stable package and service, do not reinstall it merely for the certificate-path migration.
 
-### 5. Compatibility conversion for previously migrated servers
+### 2. Compatibility conversion for previously migrated servers
 
 Servers that were migrated with an earlier version of these scripts may still run Caddy and/or sing-box as another service account. For those servers only:
 
@@ -311,7 +315,7 @@ This changes both services to `www-data:www-data`, fixes Caddy/sing-box state an
 
 A server migrated from scratch with the current scripts normally does not need this compatibility step if both services already show the expected runtime identities.
 
-### 6. Final verification
+### 3. Final verification
 
 ```bash
 echo '=== services ==='

@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory=$true)]
     [ValidatePattern('^[0-9a-f]{40}$')][string]$Revision,
-    [string[]]$Targets = @('hk','sg','jp','jp2','jp3','jp4','kr','kr2','kr3','us','us2','us3','us4','us5','us6','us7','tr'),
+    [Parameter(Mandatory=$true)][string[]]$Targets,
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -35,14 +35,20 @@ set -eu
 archive="$HOME/__NAME__"
 work=$(sudo mktemp -d /root/caddy-batch.XXXXXXXX)
 trap 'rm -f -- "$archive"; sudo rm -rf -- "$work"' EXIT
-sudo tar -xf "$archive" -C "$work"
+sudo tar --no-same-owner -xf "$archive" -C "$work"
 sudo bash "$work/caddy/migrate-caddy-debian.sh" __FLAG__
 '@
         $remote = $remote.Replace('__NAME__',$name).Replace('__FLAG__',$flag).Replace("`r`n","`n")
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remote))
-        & ssh -t -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 $target "printf %s $encoded | base64 -d | bash"
+        $output = & ssh -t -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 $target "printf %s $encoded | base64 -d | bash"
+        $sshExit = $LASTEXITCODE
+        $output | ForEach-Object { Write-Host $_ }
         $result = 'FAILED'
-        if ($LASTEXITCODE -eq 0) { $result = 'PLAN OK'; if ($Apply) { $result = 'APPLIED / ALREADY STANDARD' } }
+        if ($sshExit -eq 0) {
+            $result = 'PLAN OK'
+            if ($output -match 'CADDY_MIGRATION_RESULT=SKIPPED') { $result = 'SKIPPED' }
+            elseif ($Apply) { $result = 'APPLIED' }
+        }
         $results += [pscustomobject]@{Host=$target; Result=$result}
     }
 } finally {
