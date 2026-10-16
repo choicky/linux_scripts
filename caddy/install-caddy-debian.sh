@@ -101,7 +101,9 @@ install_caddy_package(){
   fi
   SERVICE_TOUCHED=true
   systemctl mask caddy >/dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
+  local -a download_policy=()
+  [[ -z "$PREPARED_DIR" ]] || download_policy+=(--no-download)
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "${download_policy[@]}" -o Dpkg::Options::="--force-confold" "caddy=$PACKAGE_VERSION"
   systemctl stop caddy
   systemctl disable caddy >/dev/null 2>&1 || true
   install -m 0755 "$BUILD_DIR/caddy-linux-${ARCH}" "$CADDY_CUSTOM"
@@ -125,7 +127,7 @@ download_custom_caddy(){
   grep -Fq "$MODULE_CF_IP" <<<"$modules" || die "Missing caddy-cloudflare-ip."
   grep -Fq 'caddy.adapters.jsonc github.com/caddyserver/caddy/v2' <<<"$modules" || die "Missing built-in JSONC adapter."
   log "Custom binary verified; preparing the exact APT package before stopping Caddy"
-  apt-get install --download-only -y "caddy=$PACKAGE_VERSION"
+  apt-get install --download-only --reinstall -y "caddy=$PACKAGE_VERSION"
 }
 
 save_prepared(){

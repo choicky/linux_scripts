@@ -20,7 +20,7 @@ Personal Linux server administration and deployment scripts.
 - `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
 - `sing-box/migrate-caddy-cert-paths.sh` — migrate sing-box certificate/key paths from legacy Caddy storage to the standard Caddy storage.
-- `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
+- `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while preserving the existing password-authentication policy by default.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
 
@@ -235,7 +235,7 @@ service to prevent restart loops, then prints status and recent journal entries.
 Earlier installation failures also leave the service stopped and masked; fix
 the reported cause and rerun.
 
-## One-time migration of an old server
+## Standardize existing VPS installations
 
 The migration reconciles existing manual and already standardized Caddy layouts.
 It supports Debian 12/13, JSONC at `/etc/caddy/caddy.jsonc`, an active Caddy,
@@ -259,6 +259,8 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
 - Standard installation with legacy storage: copy storage and adapt both configs.
 - Manual installation: prepare and verify the matching custom core and pre-download
   the APT package before stopping services, then install the standard layout.
+  Prepared installation uses `--no-download` and reinstalls the exact official
+  package even if APT already records that version as installed.
 - Plan prints a diff of changed path fields only, avoiding credential disclosure.
   Legacy `/home/tls` references are scanned in Caddy/sing-box configs, systemd units,
   nginx/haproxy configs and cron.d at plan time and after apply. Remaining references
@@ -288,7 +290,10 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
 
 ### Windows batch entry
 
-`caddy/Invoke-CaddyMigration.ps1` downloads one immutable repository revision and
+`caddy/Standardize-Caddy.ps1` is a compatibility entry for
+`caddy/Invoke-CaddyMigration.ps1`; `standardize-caddy.bat` launches it. Keep all
+three files together and supply `-Targets` and a full `-Revision` explicitly.
+The implementation downloads one immutable repository revision and
 uploads the same scripts to each SSH alias. Targets must be supplied explicitly using local SSH aliases; keep your fleet list locally. Each host can prompt for its sudo password; failed hosts do not stop the
 remaining hosts. Use a commit containing these scripts, not a moving branch name.
 
@@ -385,7 +390,7 @@ bash caddy/update-caddy-debian.sh
 The updater deliberately prepares the custom binary **before** changing the APT package. It:
 
 1. refreshes APT metadata and reads the Caddy Stable candidate version;
-2. exits without restarting Caddy when the installed APT version is already current;
+2. exits without restarting only when both installed stock and custom versions match the candidate;
 3. downloads the exactly matching `caddy-linux-amd64` or `caddy-linux-arm64` release and `SHA256SUMS` from `choicky/caddy-custom-build`;
 4. verifies SHA256, version, `caddy-l4`, `caddy-cloudflare-ip`, and built-in JSONC support;
 5. validates the current JSONC configuration with the new custom binary as `www-data`;

@@ -31,7 +31,7 @@ done
 
 rollback(){
   local rc=$1 failed=0 path
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   set +e
   if [[ "$CHANGED" == true ]]; then
     echo 'Migration failed; restoring previous configuration and runtime.' >&2
@@ -83,6 +83,7 @@ rollback(){
 trap 'rollback $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 scan_legacy(){
   local caddy_file=$1 sing_file=$2 result=0 matches
@@ -127,12 +128,18 @@ if [[ -e "$SING" ]]; then
   [[ -x "$SING_CORE" ]] || die 'Missing service sing-box executable.'
   if systemctl is-active --quiet sing-box; then SING_ACTIVE=true; fi
 fi
+DIVERSION="$(dpkg-divert --truename /usr/bin/caddy)"
+[[ "$DIVERSION" == /usr/bin/caddy || "$DIVERSION" == /usr/bin/caddy.default ]] || die "Unexpected diversion: $DIVERSION"
 STANDARD=false
 if [[ -L /usr/bin/caddy && "$(readlink -f /usr/bin/caddy)" == /usr/bin/caddy.custom && -x /usr/bin/caddy.default && -x /usr/bin/caddy.custom ]] &&
    dpkg-query -W -f='${Status}\n' caddy 2>/dev/null | grep -Fxq 'install ok installed' &&
    dpkg-divert --list /usr/bin/caddy | grep -Fq '/usr/bin/caddy.default' &&
    [[ "$FRAGMENT" == /usr/lib/systemd/system/caddy.service || "$FRAGMENT" == /lib/systemd/system/caddy.service ]] &&
-   [[ "$CORE" == /usr/bin/caddy ]]; then STANDARD=true; fi
+   [[ "$CORE" == /usr/bin/caddy ]]; then
+  STOCK_VERSION="$(/usr/bin/caddy.default version | awk '{print $1}')"
+  CUSTOM_VERSION="$(/usr/bin/caddy.custom version | awk '{print $1}')"
+  if [[ -n "$STOCK_VERSION" && "$STOCK_VERSION" == "$CUSTOM_VERSION" ]]; then STANDARD=true; fi
+fi
 [[ "$STORAGE_ONLY" == false || "$STANDARD" == true ]] || die '--storage-only requires standard binary/service layout.'
 WORK="$(mktemp -d /tmp/caddy-reconcile.XXXXXXXX)"
 SING_ARG=-
