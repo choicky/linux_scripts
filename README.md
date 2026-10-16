@@ -262,7 +262,16 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
 - Plan prints a diff of changed path fields only, avoiding credential disclosure.
   Legacy `/home/tls` references are scanned in Caddy/sing-box configs, systemd units,
   nginx/haproxy configs and cron.d at plan time and after apply. Remaining references
-  block apply. Backup filenames are excluded; inspect custom consumers outside
+  block both plan and apply with exit code 4 (BLOCKED). Already-standardized
+  runs return 3 (SKIPPED); a completed plan/apply returns 0. The Windows wrapper
+  streams SSH output directly so sudo prompts and download progress stay visible.
+  Preflight excludes only the local legacy unit that will be removed and the
+  override.conf that will be replaced; other retained drop-ins remain scanned.
+  The post-apply scan has no such exclusions.
+  Backup filenames with .bak/.old/.before-/.migration- are excluded;
+  names such as caddy.jsonc.orig and config.json~ are intentionally still reported.
+  Review these files before moving backups outside scanned directories;
+  inspect custom consumers outside
   these directories separately. Comments containing old paths can also trigger review.
 - Only Caddy `storage.root` and sing-box `certificate_path`/`key_path` are edited;
   comments and unrelated values remain. Both candidate configs are validated as

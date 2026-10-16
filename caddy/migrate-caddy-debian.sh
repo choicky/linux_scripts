@@ -51,7 +51,12 @@ rollback(){
           rm -f -- "$path" || failed=1
         fi
       done
-      cp -a "$BACKUP/fragment" /etc/systemd/system/caddy.service || failed=1
+      if [[ "$FRAGMENT" == /etc/systemd/system/caddy.service ]]; then
+        cp -a "$BACKUP/fragment" "$FRAGMENT" || failed=1
+      else
+        # Do not shadow the package-owned vendor unit with a local copy.
+        rm -f /etc/systemd/system/caddy.service || failed=1
+      fi
       rm -rf /etc/systemd/system/caddy.service.d
       if [[ -d "$BACKUP/dropins" ]]; then cp -a "$BACKUP/dropins" /etc/systemd/system/caddy.service.d || failed=1; fi
     fi
@@ -75,7 +80,8 @@ trap 'exit 143' TERM
 
 scan_legacy(){
   local caddy_file=$1 sing_file=$2 result=0 matches
-  matches="$(python3 "$SCRIPT_DIR/scan-legacy-paths.py" "$CONFIG" "$SING" "$caddy_file" "$sing_file")" || result=$?
+  shift 2
+  matches="$(python3 "$SCRIPT_DIR/scan-legacy-paths.py" "$CONFIG" "$SING" "$caddy_file" "$sing_file" "$@")" || result=$?
   if [[ -n "$matches" ]]; then
     printf '\nWARNING: legacy /home/tls references remain (file:line only):\n%s\n' "$matches" >&2
     echo 'Review renewal consumers before applying; old storage will no longer receive Caddy renewals.' >&2
@@ -141,15 +147,23 @@ CADDY_CHANGE=false
 [[ "$STANDARD" == true && "$SOURCE" == "$NEW" ]] || CADDY_CHANGE=true
 log "Standard installation: $STANDARD; Caddy storage: $SOURCE; sing-box path changes: $SING_CHANGES"
 python3 "$SCRIPT_DIR/scan-legacy-paths.py" --changes "$CONFIG" "$SING_ARG" "$WORK/caddy.jsonc" "$WORK/sing-box.json"
-if ! scan_legacy "$WORK/caddy.jsonc" "$WORK/sing-box.json"; then
-  [[ "$APPLY" == false ]] || die 'Resolve remaining legacy references before --apply.'
+# Ignore only files this transaction will remove or overwrite. Other drop-ins
+# remain effective after installation and must still be inspected.
+PLAN_EXCLUDES=()
+if [[ "$STANDARD" == false ]]; then
+  [[ "$FRAGMENT" != /etc/systemd/system/caddy.service ]] || PLAN_EXCLUDES+=("$FRAGMENT")
+  PLAN_EXCLUDES+=(/etc/systemd/system/caddy.service.d/override.conf)
+fi
+if ! scan_legacy "$WORK/caddy.jsonc" "$WORK/sing-box.json" "${PLAN_EXCLUDES[@]}"; then
+  echo 'CADDY_MIGRATION_RESULT=BLOCKED'
+  exit 4
 fi
 if [[ "$STANDARD" == true && "$SOURCE" == "$NEW" && "$SING_CHANGES" == 0 ]]; then
   runuser -u www-data -- env HOME=/var/lib/caddy "$CORE" validate --config "$CONFIG" --adapter jsonc
   [[ "$SING_PRESENT" == false ]] || runuser -u www-data -- "$SING_CORE" -D /var/lib/sing-box check -c "$SING"
   log 'Already standardized; no files changed and no services restarted.'
   echo 'CADDY_MIGRATION_RESULT=SKIPPED'
-  exit 0
+  exit 3
 fi
 if [[ "$APPLY" == false ]]; then
   log 'Read-only plan complete. Rerun with --apply to reconcile Caddy and sing-box.'

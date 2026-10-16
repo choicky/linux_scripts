@@ -8,15 +8,18 @@ ROOTS = ['/etc/caddy', '/etc/sing-box', '/etc/systemd/system',
          '/usr/lib/systemd/system', '/etc/nginx', '/etc/haproxy', '/etc/cron.d']
 
 
-def scan(caddy, sing, candidate_caddy, candidate_sing):
+def scan(caddy, sing, candidate_caddy, candidate_sing, *exclude):
     replacements = {Path(caddy): Path(candidate_caddy), Path(sing): Path(candidate_sing)}
     files = set(replacements)
     for root in ROOTS:
         directory = Path(root)
         if directory.exists():
             files.update(p for p in directory.rglob('*') if p.is_file())
+    excluded = {Path(p) for p in exclude}
     findings = []
     for path in sorted(files):
+        if path in excluded:
+            continue
         # Backups do not consume certificates. Report files, not secret contents.
         if any(marker in path.name for marker in ('.bak', '.old', '.before-', '.migration-')):
             continue

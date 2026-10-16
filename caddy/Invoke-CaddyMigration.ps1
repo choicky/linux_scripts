@@ -36,23 +36,26 @@ archive="$HOME/__NAME__"
 work=$(sudo mktemp -d /root/caddy-batch.XXXXXXXX)
 trap 'rm -f -- "$archive"; sudo rm -rf -- "$work"' EXIT
 sudo tar --no-same-owner -xf "$archive" -C "$work"
+set +e
 sudo bash "$work/caddy/migrate-caddy-debian.sh" __FLAG__
+result=$?
+exit "$result"
 '@
         $remote = $remote.Replace('__NAME__',$name).Replace('__FLAG__',$flag).Replace("`r`n","`n")
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remote))
-        $output = & ssh -t -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 $target "printf %s $encoded | base64 -d | bash"
+        & ssh -t -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 $target "printf %s $encoded | base64 -d | bash"
         $sshExit = $LASTEXITCODE
-        $output | ForEach-Object { Write-Host $_ }
         $result = 'FAILED'
         if ($sshExit -eq 0) {
             $result = 'PLAN OK'
-            if ($output -match 'CADDY_MIGRATION_RESULT=SKIPPED') { $result = 'SKIPPED' }
-            elseif ($Apply) { $result = 'APPLIED' }
+            if ($Apply) { $result = 'APPLIED' }
         }
+        elseif ($sshExit -eq 3) { $result = 'SKIPPED' }
+        elseif ($sshExit -eq 4) { $result = 'BLOCKED' }
         $results += [pscustomobject]@{Host=$target; Result=$result}
     }
 } finally {
     $results | Format-Table -AutoSize
     Remove-Item -LiteralPath $work -Recurse -Force
 }
-if (@($results | Where-Object { $_.Result -like '*FAILED*' }).Count -gt 0) { throw 'Some hosts failed; inspect their output before retrying.' }
+if (@($results | Where-Object { $_.Result -like '*FAILED*' -or $_.Result -eq 'BLOCKED' }).Count -gt 0) { throw 'Some hosts failed or were blocked; inspect their output before retrying.' }
