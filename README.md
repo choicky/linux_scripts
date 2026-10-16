@@ -254,12 +254,14 @@ git pull --ff-only
 # Plan: does not stop services or install packages.
 bash caddy/migrate-caddy-debian.sh
 # For already verified installations: never install/upgrade packages:
-bash caddy/migrate-caddy-debian.sh --config-only
-# Execute the reviewed plan:
-bash caddy/migrate-caddy-debian.sh --apply
+bash caddy/migrate-caddy-debian.sh --config-only --archive-configs
+# Execute the reviewed config-only/archive plan with the same options:
+bash caddy/migrate-caddy-debian.sh --config-only --archive-configs --apply
 # Optional: refuse a binary migration, allow storage-only on a standard layout:
 bash caddy/migrate-caddy-debian.sh --storage-only --apply
 ```
+
+`--archive-configs` archives complete configuration directories under the migration backup, then restores only the active main configurations and explicitly referenced local files/directories. The plan lists inactive files to archive; those files do not block the plan for legacy certificate references. Existing symlinks, ambiguous relative file references, and multiple effective sing-box directory inputs require review. Services stop during directory replacement; failure restores both complete original directories. Config-only mode still refuses any package installation. Run the same reviewed plan with `--apply` / `-Apply`.
 
 - Already standard installation, storage and paths: validate and skip restarting.
 - Standard installation with legacy storage: copy storage and adapt both configs.
@@ -280,10 +282,9 @@ bash caddy/migrate-caddy-debian.sh --storage-only --apply
   symlinks; links to files outside the scan roots are still inspected.
   The post-apply scan has no such exclusions.
   Backup filenames with .bak/.old/.before-/.migration- are excluded;
-  Confirmed dated backup names `caddy.jsonc-good-YYYYMMDD` and
-  `config.json-good-YYYYMMDD` are reported as ignored and left untouched.
   Names such as caddy.jsonc.orig and config.json~ are intentionally still reported.
-  Review these files before moving backups outside scanned directories;
+  With `--archive-configs`, inactive files are archived regardless of filename;
+  retained runtime dependencies remain scanned. Without it, review reported files;
   inspect custom consumers outside
   these directories separately. Comments containing old paths can also trigger review.
 - Only Caddy `storage.root` and sing-box `certificate_path`/`key_path` are edited;
@@ -306,10 +307,10 @@ uploads the same scripts to each SSH alias. Targets must be supplied explicitly 
 remaining hosts. Use a commit containing these scripts, not a moving branch name.
 
 ```powershell
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly -Apply
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly -ArchiveConfigs
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk -ConfigOnly -ArchiveConfigs -Apply
 # After checking KR3, explicitly choose the next hosts:
-.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk,sg -Apply
+.\Invoke-CaddyMigration.ps1 -Revision <40-character-commit> -Targets hk,sg -ConfigOnly -ArchiveConfigs -Apply
 ```
 
 The separate `sing-box/migrate-caddy-cert-paths.sh` remains useful for path-only

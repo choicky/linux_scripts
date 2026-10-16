@@ -14,6 +14,34 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 
+class DirectoryPlanTests(unittest.TestCase):
+    def inspect(self, root, data):
+        path=root/'caddy.jsonc';path.write_text(json.dumps(data))
+        spec=importlib.util.spec_from_file_location('directory_plan',ROOT/'caddy/config-directory-plan.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.plan([str(path)])
+
+    def test_referenced_directory_retains_contents_and_ancestors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);asset=root/'private/rules';asset.mkdir(parents=True)
+            (asset/'one.srs').write_bytes(b'rules');old=root/'anything-new';old.write_text('old')
+            result=self.inspect(root,{'path':str(asset)})
+            self.assertIn(str(asset/'one.srs'),result['keep'])
+            self.assertIn(str(asset.parent),result['keep'])
+            self.assertEqual(result['exclude'],[str(old)])
+
+    def test_relative_dependency_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError,'relative file'):
+                self.inspect(Path(tmp),{'certificate_path':'cert.pem'})
+
+    def test_symlink_refused_before_archival(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'old-link').symlink_to('/no-such-file')
+            with self.assertRaisesRegex(ValueError,'symlinks'):
+                self.inspect(root,{})
+
+
 class ConfigTests(unittest.TestCase):
     def test_scoped_comment_preserving_edits_and_second_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,7 +115,7 @@ class ScanTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False, failure_code=9, version_skew=False, prepare_fail=False, directory=False, extra_json=False, fail_restart=False, missing_source=False):
+    def exercise(self, fail=False, noop=False, plan=False, legacy=False, path_only=False, residual=False, install_fail=False, caddy_only=False, local_unit=False, retained_dropin=False, failure_code=9, version_skew=False, prepare_fail=False, directory=False, extra_json=False, fail_restart=False, missing_source=False, archive=False):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp); fs = d/'fs'; scripts = d/'scripts'; scripts.mkdir()
             for p in ['etc/caddy','etc/sing-box','etc/systemd/system/caddy.service.d','usr/bin','usr/lib/systemd/system','home/tls/certificates','var/lib/caddy/.local/share/caddy/certificates','var/lib/sing-box','run/lock','tmp']:
@@ -110,6 +138,13 @@ class LifecycleTests(unittest.TestCase):
                 value=json.loads(s.read_text()); value['other']='/home/tls/extra.crt'; s.write_text(json.dumps(value))
             elif residual:
                 (fs/'etc/sing-box/other.json').write_text('{"other":"/home/tls/extra.crt"}')
+            archive_file = fs/'etc/caddy/caddy.jsonc-good-20260831v2'
+            dependency = fs/'etc/sing-box/rules/local.srs'
+            if archive:
+                archive_file.write_text('old /home/tls')
+                dependency.parent.mkdir()
+                dependency.write_bytes(b'rule data')
+                value=json.loads(s.read_text()); value['route']={'rule_set':[{'path':str(dependency)}]}; s.write_text(json.dumps(value))
             before = c.read_bytes(), s.read_bytes()
             fragment=fs/('etc/systemd/system/caddy.service' if local_unit else 'usr/lib/systemd/system/caddy.service')
             fragment.write_text('[Service]\nUser=www-data\n' + ('ReadWritePaths=/home/tls\n' if local_unit else ''))
@@ -129,6 +164,7 @@ class LifecycleTests(unittest.TestCase):
             launch=(ROOT/'caddy/sing-box-service-plan.py').read_text()
             launch=re.sub(r'/(?:etc/|var/lib/)',lambda m:str(fs)+m[0],launch)
             (scripts/'sing-box-service-plan.py').write_text(launch)
+            (scripts/'config-directory-plan.py').write_text((ROOT/'caddy/config-directory-plan.py').read_text())
             if extra_json:(fs/'etc/sing-box/extra.json').write_text('{}')
             launch_dropin=fs/'etc/systemd/system/sing-box.service.d/zzzz-caddy-single-file.conf'
             (fs/'etc/systemd/system/sing-box.service.d').mkdir(parents=True,exist_ok=True)
@@ -186,8 +222,15 @@ exit 0
                 p=bins/name;p.write_text(text);p.chmod(0o755)
             script=scripts/'migrate-caddy-debian.sh';script.write_text(src)
             env=dict(os.environ,PATH=str(bins)+':'+os.environ['PATH'])
-            r=subprocess.run(['bash',str(script)]+([] if plan else ['--apply']),env=env,text=True,capture_output=True)
+            r=subprocess.run(['bash',str(script)]+([] if plan else ['--apply'])+(['--archive-configs'] if archive else []),env=env,text=True,capture_output=True)
             self.assertEqual(r.returncode, 1 if extra_json else 9 if fail_restart else 4 if residual or retained_dropin else 8 if install_fail or prepare_fail else (1 if failure_code in (3,4) else failure_code) if fail else 3 if noop and not directory else 0, r.stdout+r.stderr)
+            if archive:
+                self.assertEqual(dependency.read_bytes(), b'rule data')
+                self.assertEqual(archive_file.exists(), bool(plan or fail or fail_restart or install_fail))
+                if not plan:
+                    backups=list((fs/'root/caddy-migration-backup').glob('*/config-directories'))
+                    self.assertEqual(len(backups),1)
+                    self.assertEqual((backups[0]/str(archive_file).lstrip('/')).read_text(),'old /home/tls')
             logs=calls.read_text()
             self.assertEqual(preserved.read_text(),'[Service]\nUser=www-data\n')
             if directory and noop:
@@ -224,6 +267,12 @@ exit 0
             if residual:
                 self.assertIn('config.json:1' if residual == 'main' else 'other.json:1',r.stderr)
             if not missing_source:self.assertEqual((Path(old)/'certificates/a.crt').read_text(),'SOURCE CERT')
+
+    def test_archive_installer_failure_restores_complete_directories(self):self.exercise(archive=True,legacy=True,install_fail=True)
+    def test_archive_plan_leaves_all_files(self):self.exercise(archive=True,plan=True)
+    def test_archive_removes_history_preserves_dependencies(self):self.exercise(archive=True,directory=True)
+    def test_archive_validation_failure_restores_complete_directories(self):self.exercise(archive=True,directory=True,fail=True)
+    def test_archive_restart_failure_restores_complete_directories(self):self.exercise(archive=True,directory=True,fail_restart=True)
 
     def test_directory_only_conversion_does_not_restart_caddy(self):
         self.exercise(directory=True,noop=True)

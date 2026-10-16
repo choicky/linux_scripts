@@ -4,6 +4,7 @@ param(
     [ValidatePattern('^[0-9a-f]{40}$')][string]$Revision,
     [Parameter(Mandatory=$true)][string[]]$Targets,
     [switch]$ConfigOnly,
+    [switch]$ArchiveConfigs,
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,7 @@ try {
         $flag = ''
         if ($Apply) { $flag = '--apply' }
         if ($ConfigOnly) { $flag += ' --config-only' }
+        if ($ArchiveConfigs) { $flag += ' --archive-configs' }
         $remote = @'
 set -eu
 archive="$HOME/__NAME__"
