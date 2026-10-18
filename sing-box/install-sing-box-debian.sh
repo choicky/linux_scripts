@@ -14,10 +14,12 @@ readonly KEYRING_DIR="/etc/apt/keyrings"
 readonly DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
 readonly RUN_DROPIN_DIR="/run/systemd/system/sing-box.service.d"
 readonly DROPIN_FILE="${DROPIN_DIR}/override.conf"
+readonly LOCAL_UNIT="/etc/systemd/system/sing-box.service"
 readonly EXPECTED_EXEC="/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run"
 readonly DROPIN_CONTENT="[Service]
 User=www-data
 Group=www-data
+StateDirectoryMode=0755
 ExecStart=
 ExecStart=${EXPECTED_EXEC}"
 readonly GPG_URL="https://sing-box.app/gpg.key"
@@ -36,6 +38,8 @@ SERVICE_WAS_ACTIVE=false
 SERVICE_WAS_ENABLED=false
 SERVICE_WAS_MASKED=false
 SERVICE_UNIT_PRESENT=false
+SERVICE_RUNTIME_TRANSITION=none
+VENDOR_UNIT=""
 PACKAGE_CHANGED=false
 PACKAGE_VERSION_BEFORE=""
 PACKAGE_VERSION_RECORDED=false
@@ -107,7 +111,7 @@ preflight(){
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
   local command
-  for command in systemctl dpkg dpkg-query apt-get getent install find mktemp runuser cmp; do
+  for command in systemctl dpkg dpkg-query apt-get getent install find mktemp runuser cmp readlink; do
     command -v "$command" >/dev/null 2>&1 || die "Missing required command: $command"
   done
   log "Environment: ${PRETTY_NAME:-${ID} ${VERSION_ID:-}}, architecture: $(dpkg --print-architecture)"
@@ -128,6 +132,29 @@ record_service_state(){
   fi
 }
 
+check_directory_mode_inputs(){
+  local current_exec config_dir
+  local -a extras=()
+
+  current_exec="$(systemctl show sing-box -p ExecStart --value 2>/dev/null || true)"
+  # Reuse the migration helper's safety rule: a directory-mode service may be
+  # loading more than config.json. Do not silently replace it with -c.
+  if [[ ! "$current_exec" =~ -C[[:space:]]+([^[:space:]\;]+) ]]; then
+    return 0
+  fi
+  config_dir=${BASH_REMATCH[1]}
+  [[ -d "$config_dir" ]] || return 0
+  mapfile -t extras < <(
+    find "$config_dir" -maxdepth 1 \
+      \( -name '*.json' -o -name '*.jsonc' \) ! -name config.json -print 2>/dev/null
+  )
+  if (( ${#extras[@]} )); then
+    printf 'Existing service uses directory mode with additional inputs:\n' >&2
+    printf '  %s\n' "${extras[@]}" >&2
+    die "Refusing to replace -C $config_dir with -c $CONFIG because those inputs would be silently omitted. Move or merge them first; sing-box/migrate-caddy-cert-paths.sh applies the same rule."
+  fi
+}
+
 check_preconditions(){
   local path
   for path in /etc/sing-box /var/lib/sing-box /var/log/sing-box \
@@ -143,11 +170,21 @@ check_preconditions(){
   [[ ! -e "$CONFIG" || -f "$CONFIG" ]] \
     || die "$CONFIG exists but is not a regular file."
   [[ ! -L "$CONFIG" ]] || die "$CONFIG is a symlink; refusing to follow it."
+  if [[ -e "$LOCAL_UNIT" || -L "$LOCAL_UNIT" ]]; then
+    if [[ -L "$LOCAL_UNIT" ]]; then
+      die "$LOCAL_UNIT is a symlink/mask; inspect and remove it before running this installer."
+    elif [[ ! -f "$LOCAL_UNIT" ]]; then
+      die "$LOCAL_UNIT exists but is not a regular file; refusing to continue."
+    else
+      die "Local unit $LOCAL_UNIT shadows the package-owned vendor unit. Refusing to make changes while it remains authoritative; inspect it and either migrate it with 'bash sing-box/migrate-caddy-cert-paths.sh' (after the service is on www-data:www-data) or archive it, then rerun."
+    fi
+  fi
   if [[ "$SERVICE_WAS_ACTIVE" == true && ! -f "$CONFIG" ]]; then
     # Never take down a running service when we cannot validate its configured
     # startup path. The operator must provide the configuration first.
     die "$CONFIG is missing; refusing to stop or reconfigure the running sing-box service."
   fi
+  check_directory_mode_inputs
 }
 
 unmask_service(){
@@ -314,7 +351,10 @@ install_packages(){
   PACKAGE_VERSION_RECORDED=true
   log "Installing sing-box Stable from the official APT repository"
   apt-get -o Acquire::ForceIPv4=true update
-  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y \
+  # The package ships /etc/sing-box/config.json as a conffile. Force the
+  # dpkg conffile policy explicitly so existing configuration is preserved.
+  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true \
+    -o Dpkg::Options::=--force-confold install -y \
     ca-certificates curl gnupg sing-box
 
   dpkg-query -W -f='${Status}\n' sing-box 2>/dev/null | grep -Fxq 'install ok installed' \
@@ -328,6 +368,31 @@ install_packages(){
     PACKAGE_CHANGED=true
     log "sing-box package changed: ${before:-not installed} -> ${after:-unknown}"
   fi
+
+  # The upstream package has no maintainer scripts, so systemd is not reloaded
+  # and the running process is not restarted merely by apt/dpkg. Reload here
+  # only when the package or unit presence actually changed.
+  if [[ "$PACKAGE_CHANGED" == true || "$SERVICE_UNIT_PRESENT" == false ]]; then
+    systemctl daemon-reload
+  fi
+  verify_vendor_unit
+}
+
+verify_vendor_unit(){
+  local path fragment
+  VENDOR_UNIT=""
+  for path in /usr/lib/systemd/system/sing-box.service /lib/systemd/system/sing-box.service; do
+    if [[ -f "$path" ]] && dpkg-query -L sing-box 2>/dev/null | grep -Fxq "$path"; then
+      VENDOR_UNIT=$path
+      break
+    fi
+  done
+  [[ -n "$VENDOR_UNIT" ]] \
+    || die "Package-owned sing-box vendor unit is missing; refusing to normalize a local or incomplete service layout."
+  fragment="$(systemctl show sing-box -p FragmentPath --value 2>/dev/null || true)"
+  [[ -n "$fragment" ]] || die "Cannot determine the effective sing-box unit file."
+  [[ "$(readlink -f "$fragment")" == "$(readlink -f "$VENDOR_UNIT")" ]] \
+    || die "Effective unit is $fragment, not the package-owned vendor unit $VENDOR_UNIT; a local or runtime unit still shadows it."
 }
 
 backup_dropin_dir(){
@@ -483,7 +548,7 @@ validate_installation(){
 }
 
 verify_service_config(){
-  local effective_exec load_state state_dir_mode
+  local effective_exec load_state state_dir_mode state_dir fragment
   load_state="$(systemctl show sing-box -p LoadState --value 2>/dev/null || true)"
   [[ "$load_state" != "masked" ]] || die "sing-box is unexpectedly masked."
   [[ "$load_state" != "not-found" ]] || die "sing-box unit not found."
@@ -491,9 +556,18 @@ verify_service_config(){
     || die "Effective User is not www-data."
   [[ "$(systemctl show sing-box -p Group --value)" == "www-data" ]] \
     || die "Effective Group is not www-data."
+  if [[ -n "$VENDOR_UNIT" ]]; then
+    fragment="$(systemctl show sing-box -p FragmentPath --value 2>/dev/null || true)"
+    [[ -n "$fragment" && "$(readlink -f "$fragment")" == "$(readlink -f "$VENDOR_UNIT")" ]] \
+      || die "Effective unit is ${fragment:-unknown}, not the package-owned vendor unit $VENDOR_UNIT."
+  fi
   state_dir_mode="$(systemctl show sing-box -p StateDirectoryMode --value 2>/dev/null || true)"
-  [[ -z "$state_dir_mode" || "$state_dir_mode" == "0755" ]] \
-    || die "Effective StateDirectoryMode is not 0755: $state_dir_mode"
+  state_dir="$(systemctl show sing-box -p StateDirectory --value 2>/dev/null || true)"
+  # The current vendor unit has no StateDirectory, so systemd normally reports
+  # the default 0755. A stale 0750 override must not survive; an empty mode is
+  # tolerated only when no StateDirectory is configured at all.
+  [[ "$state_dir_mode" == "0755" || ( -z "$state_dir_mode" && -z "$state_dir" ) ]] \
+    || die "Effective StateDirectoryMode is not 0755: ${state_dir_mode:-unknown}"
   effective_exec="$(systemctl show sing-box -p ExecStart --value)"
   local expected='^\{ path=/usr/bin/sing-box ; argv\[\]=/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config\.json run ;[^{}]*\}$'
   [[ "$effective_exec" =~ $expected ]] \
@@ -509,16 +583,37 @@ verify_service_runtime(){
   fi
 }
 
+ensure_service_enabled(){
+  if ! systemctl is-enabled --quiet sing-box 2>/dev/null; then
+    systemctl enable sing-box >/dev/null || die "Failed to enable sing-box."
+  fi
+  systemctl is-enabled --quiet sing-box 2>/dev/null \
+    || die "sing-box is not enabled after enablement."
+}
+
+service_start(){
+  SERVICE_RUNTIME_TRANSITION=started
+  systemctl start sing-box
+}
+
+service_restart(){
+  SERVICE_RUNTIME_TRANSITION=restarted
+  systemctl restart sing-box
+}
+
+service_stop(){
+  SERVICE_RUNTIME_TRANSITION=stopped
+  systemctl stop sing-box
+}
+
 reconcile_service(){
   # Validate the unit's effective configuration before starting, stopping or
   # restarting anything, so a bad drop-in cannot cause a wrong-config start.
   verify_service_config
 
   if [[ "$NO_START" == true ]]; then
-    if ! systemctl is-enabled --quiet sing-box 2>/dev/null; then
-      systemctl enable sing-box >/dev/null
-    fi
-    systemctl stop sing-box >/dev/null 2>&1 || true
+    ensure_service_enabled
+    service_stop >/dev/null 2>&1 || true
     [[ "$(systemctl is-active sing-box 2>/dev/null || true)" != "active" ]] \
       || die "sing-box is still active despite --no-start."
     log "sing-box is unmasked and enabled but not started (--no-start)."
@@ -527,7 +622,7 @@ reconcile_service(){
 
   if [[ ! -f "$CONFIG" ]]; then
     # A running service with a missing config was rejected before any change.
-    systemctl stop sing-box >/dev/null 2>&1 || true
+    service_stop >/dev/null 2>&1 || true
     [[ "$(systemctl is-active sing-box 2>/dev/null || true)" != "active" ]] \
       || die "sing-box is still active although $CONFIG is absent."
     log "sing-box is installed but $CONFIG is absent; service not started."
@@ -535,17 +630,15 @@ reconcile_service(){
   fi
   [[ "$CONFIG_CHECKED" == true ]] || die "Refusing startup without a successful configuration check."
 
-  if ! systemctl is-enabled --quiet sing-box 2>/dev/null; then
-    systemctl enable sing-box >/dev/null
-  fi
+  ensure_service_enabled
   if [[ "$SERVICE_WAS_ACTIVE" == true ]]; then
     if [[ "$DROPIN_CHANGED" == true || "$PACKAGE_CHANGED" == true ]]; then
-      systemctl restart sing-box || die "sing-box failed to restart."
+      service_restart || die "sing-box failed to restart."
     elif ! systemctl is-active --quiet sing-box; then
-      systemctl start sing-box || die "sing-box failed to start."
+      service_start || die "sing-box failed to start."
     fi
   else
-    systemctl start sing-box || die "sing-box failed to start."
+    service_start || die "sing-box failed to start."
   fi
   verify_service_config
   verify_service_runtime
@@ -578,16 +671,44 @@ rollback(){
       systemctl disable sing-box >/dev/null 2>&1 || failed=1
     fi
     if [[ "$SERVICE_WAS_ACTIVE" == true ]]; then
-      if systemctl is-active --quiet sing-box 2>/dev/null; then
-        if [[ "$DROPIN_CHANGED" == true || "$PACKAGE_CHANGED" == true ]]; then
+      case "$SERVICE_RUNTIME_TRANSITION" in
+        restarted)
+          # The running process may already use the candidate drop-in; restore
+          # the backed-up unit and apply it again.
           systemctl restart sing-box >/dev/null 2>&1 || failed=1
-        fi
-      else
-        systemctl start sing-box >/dev/null 2>&1 || failed=1
-      fi
+          ;;
+        started)
+          if [[ "$DROPIN_CHANGED" == true ]]; then
+            systemctl restart sing-box >/dev/null 2>&1 || failed=1
+          elif ! systemctl is-active --quiet sing-box 2>/dev/null; then
+            systemctl start sing-box >/dev/null 2>&1 || failed=1
+          fi
+          ;;
+        stopped)
+          if ! systemctl is-active --quiet sing-box 2>/dev/null; then
+            systemctl start sing-box >/dev/null 2>&1 || failed=1
+          fi
+          ;;
+        none)
+          # A disk-only drop-in/package change did not disturb the healthy
+          # running process; do not restart it during rollback.
+          if ! systemctl is-active --quiet sing-box 2>/dev/null; then
+            systemctl start sing-box >/dev/null 2>&1 || failed=1
+          fi
+          ;;
+      esac
       systemctl is-active --quiet sing-box 2>/dev/null || failed=1
     else
-      systemctl stop sing-box >/dev/null 2>&1 || failed=1
+      case "$SERVICE_RUNTIME_TRANSITION" in
+        started|restarted|stopped)
+          systemctl stop sing-box >/dev/null 2>&1 || failed=1
+          ;;
+        none)
+          if [[ "$PACKAGE_CHANGED" == true ]] && systemctl is-active --quiet sing-box 2>/dev/null; then
+            systemctl stop sing-box >/dev/null 2>&1 || failed=1
+          fi
+          ;;
+      esac
     fi
   fi
   [[ "$failed" == 0 ]] || printf 'WARNING: rollback was incomplete; inspect sing-box before continuing.\n' >&2

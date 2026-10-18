@@ -131,8 +131,15 @@ exit 0
         F = bash_path(fs)
         calls_s = bash_path(calls)
         state_s = bash_path(state)
+        vendor_s = F + "/usr/lib/systemd/system/sing-box.service"
+        local_unit_s = F + "/etc/systemd/system/sing-box.service"
         start_fails = "1" if getattr(self, "_start_fails", False) else "0"
         start_noop = "1" if getattr(self, "_start_returns_zero_but_inactive", False) else "0"
+        stop_fails = "1" if getattr(self, "_stop_fails", False) else "0"
+        enable_fails = "1" if getattr(self, "_enable_fails", False) else "0"
+        restart_fail_once = "1" if getattr(self, "_restart_fail_once", False) else "0"
+        state_dir_mode = getattr(self, "_state_dir_mode", "0755")
+        fragment_path = getattr(self, "_fragment_path", vendor_s)
 
         systemctl_mock = r"""#!/bin/bash
 printf '%s\n' "$*" >> '@CALLS@'
@@ -144,7 +151,7 @@ FAILED='@STATE@/failed'
 LOAD_STATE='@STATE@/load_state'
 
 effective_values() {
-  local user='sing-box' group='sing-box' exec='/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run'
+  local user='sing-box' group='sing-box' exec='@FS@/usr/bin/sing-box -D @FS@/var/lib/sing-box -C @FS@/etc/sing-box run'
   local f line val
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -167,6 +174,8 @@ case "$1" in
   show)
     case "$*" in
       *LoadState*) cat "$LOAD_STATE" ;;
+      *FragmentPath*) echo '@FRAGMENT@' ;;
+      *StateDirectoryMode*) echo '@STATE_DIR_MODE@' ;;
       *ExecStart*)
         mapfile -t vals < <(effective_values)
         line="${vals[2]}"
@@ -200,7 +209,10 @@ case "$1" in
     fi
     exit 1
     ;;
-  stop) rm -f "$ACTIVE" "$FAILED" ;;
+  stop)
+    if [ '@STOP_FAILS@' = '1' ]; then exit 1; fi
+    rm -f "$ACTIVE" "$FAILED"
+    ;;
   start|restart)
     if [ '@START_FAILS@' = '1' ]; then
       touch "$FAILED"
@@ -209,10 +221,20 @@ case "$1" in
     if [ '@START_NOOP@' = '1' ]; then
       exit 0
     fi
+    if [ '@RESTART_FAIL_ONCE@' = '1' ] && [ -f '@STATE@/restart_attempted' ]; then
+      :
+    elif [ '@RESTART_FAIL_ONCE@' = '1' ]; then
+      touch '@STATE@/restart_attempted'
+      touch "$FAILED"
+      exit 1
+    fi
     rm -f "$FAILED"
     touch "$ACTIVE"
     ;;
-  enable) touch "$ENABLED" ;;
+  enable)
+    if [ '@ENABLE_FAILS@' = '1' ]; then exit 1; fi
+    touch "$ENABLED"
+    ;;
   disable) rm -f "$ENABLED" ;;
   mask) touch "$MASKED"; echo masked > "$LOAD_STATE" ;;
   unmask) rm -f "$MASKED"; echo loaded > "$LOAD_STATE" ;;
@@ -225,6 +247,11 @@ esac
             .replace("@STATE@", state_s)
             .replace("@START_FAILS@", start_fails)
             .replace("@START_NOOP@", start_noop)
+            .replace("@STOP_FAILS@", stop_fails)
+            .replace("@ENABLE_FAILS@", enable_fails)
+            .replace("@RESTART_FAIL_ONCE@", restart_fail_once)
+            .replace("@STATE_DIR_MODE@", state_dir_mode)
+            .replace("@FRAGMENT@", fragment_path)
         )
         self._write_mock(bins, "systemctl", systemctl_mock)
         self._write_mock(bins, "journalctl", "#!/bin/bash\nexit 0\n")
@@ -260,6 +287,7 @@ case "$*" in
   *sing-box-beta*) exit 1;;
   *'${{Version}}'*) if [ -f '{state_s}/version' ]; then cat '{state_s}/version'; else printf '1.10.0\\n'; fi;;
   *'${{Status}}'*) printf 'install ok installed\\n';;
+  *-L*|*--listfiles*) printf '%s\\n' '{vendor_s}';;
   *) exit 0;;
 esac
 """,
@@ -347,6 +375,8 @@ exec /usr/bin/install "${args[@]}"
             "/etc/apt/sources.list.d/sagernet.sources",
             "/etc/systemd/system/sing-box.service.d",
             "/run/systemd/system/sing-box.service.d",
+            "/etc/systemd/system/sing-box.service",
+            "/usr/lib/systemd/system/sing-box.service",
             "/etc/apt/keyrings",
             "/etc/ssl/certs/ca-certificates.crt",
             "/etc/sing-box",
@@ -411,6 +441,15 @@ exec /usr/bin/install "${args[@]}"
                 f"[Service]\nUser={wu}\nGroup={wu}\nExecStart=\nExecStart={we}\n"
             )
 
+        if getattr(self, "_has_local_unit", False):
+            (fs / "etc/systemd/system/sing-box.service").write_text(
+                "[Service]\nUser=root\nExecStart=/usr/bin/sing-box run\n"
+            )
+
+        if getattr(self, "_has_directory_mode_inputs", False):
+            (fs / "etc/sing-box/extra.json").write_text('{"log":{"level":"debug"}}\n')
+            (fs / "etc/sing-box/extra.jsonc").write_text('{"log":{"level":"warn"}}\n')
+
         if getattr(self, "_wrong_dir_perms", False):
             os.chmod(fs / "etc/sing-box", 0o700)
             os.chmod(fs / "var/lib/sing-box", 0o700)
@@ -462,6 +501,7 @@ exec /usr/bin/install "${args[@]}"
             "[Service]\n"
             "User=www-data\n"
             "Group=www-data\n"
+            "StateDirectoryMode=0755\n"
             "ExecStart=\n"
             f"ExecStart={f}/usr/bin/sing-box -D {f}/var/lib/sing-box "
             f"-c {f}/etc/sing-box/config.json run\n"
@@ -561,6 +601,7 @@ exec /usr/bin/install "${args[@]}"
             self._assert_perms_correct(fs)
             self.assertIn("curl", "\n".join(self._calls(calls)))
             self.assertIn("gpg", "\n".join(self._calls(calls)))
+            self.assertIn("--force-confold", "\n".join(self._calls(calls)))
 
     def test_fresh_ubuntu(self):
         """Scenario 2: Fresh Ubuntu installation."""
@@ -593,6 +634,56 @@ exec /usr/bin/install "${args[@]}"
             lines = self._calls(calls)
             self.assertFalse(any(line.startswith("curl ") for line in lines), "valid key must be reused")
             self.assertFalse(any(line.startswith("daemon-reload") for line in lines))
+
+    def test_parse_failure_before_service_state_does_not_touch_service(self):
+        """A pre-state parse failure must not enable/disable/stop the service."""
+        self._has_config = True
+        self._was_active = True
+        self._was_enabled = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp, args=["--not-an-option"])
+            self._fail(result)
+            self._assert_active(state)
+            self._assert_enabled(state)
+            lines = self._calls(calls)
+            for verb in ("stop", "start", "restart", "enable", "disable", "mask"):
+                self.assertFalse(
+                    any(line == f"{verb} sing-box" for line in lines),
+                    f"unexpected systemctl {verb}: {lines}",
+                )
+
+    def test_local_unit_shadowing_fails_before_changes(self):
+        """A local main unit must not be silently overridden by the vendor unit."""
+        self._has_config = True
+        self._has_local_unit = True
+        self._was_active = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("shadows the package-owned vendor unit", result.stderr)
+            self._assert_active(state)
+            self.assertTrue((fs / "etc/systemd/system/sing-box.service").exists())
+            lines = self._calls(calls)
+            self.assertFalse(any(line.startswith("apt-get ") for line in lines))
+            self.assertFalse(any(line.startswith("curl ") for line in lines))
+            self.assertNotIn("daemon-reload", lines)
+            self._assert_not_interrupted(calls)
+
+    def test_directory_mode_extra_inputs_fail_before_changes(self):
+        """Directory-mode inputs must not be silently dropped by switching to -c."""
+        self._has_config = True
+        self._has_directory_mode_inputs = True
+        self._was_active = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("additional inputs", result.stderr)
+            self._assert_active(state)
+            self.assertTrue((fs / "etc/sing-box/extra.json").exists())
+            lines = self._calls(calls)
+            self.assertFalse(any(line.startswith("apt-get ") for line in lines))
+            self.assertFalse(any(line.startswith("curl ") for line in lines))
+            self._assert_not_interrupted(calls)
 
     def test_fixes_dir_permissions(self):
         """Scenario 4: Incorrect directory permissions."""
@@ -777,7 +868,9 @@ exec /usr/bin/install "${args[@]}"
             self._assert_active(state)
             dropin = fs / "etc/systemd/system/sing-box.service.d/override.conf"
             self.assertEqual(dropin.read_text(), old_dropin)
-            self.assertIn("restart sing-box", self._calls(calls))
+            # apt changed the package but the running process was never
+            # restarted; rollback must not interrupt the still-healthy service.
+            self.assertNotIn("restart sing-box", self._calls(calls))
 
     def test_package_change_restarts_running_service(self):
         """A package upgrade restarts the running service once it is applied."""
@@ -812,7 +905,7 @@ exec /usr/bin/install "${args[@]}"
             self._assert_active(state)
             dropin = fs / "etc/systemd/system/sing-box.service.d/override.conf"
             self.assertEqual(dropin.read_text(), old_dropin)
-            self.assertIn("restart sing-box", self._calls(calls))
+            self.assertNotIn("restart sing-box", self._calls(calls))
 
     def test_apt_install_failure_restores_service_and_dropin(self):
         """Scenario 14: APT failure after drop-in replacement restores prior state."""
@@ -833,7 +926,7 @@ exec /usr/bin/install "${args[@]}"
             self._assert_active(state)
             dropin = fs / "etc/systemd/system/sing-box.service.d/override.conf"
             self.assertEqual(dropin.read_text(), old_dropin)
-            self.assertIn("restart sing-box", self._calls(calls))
+            self.assertNotIn("restart sing-box", self._calls(calls))
 
     def test_config_validation_failure_restores_dropin_and_permissions(self):
         """Scenario 15: Config failure restores drop-in content and modes."""
@@ -857,6 +950,7 @@ exec /usr/bin/install "${args[@]}"
             self.assertEqual(dropin.read_text(), old_dropin)
             self.assertEqual(os.stat(fs / "etc/sing-box").st_mode & 0o777, 0o700)
             self.assertEqual(os.stat(fs / "etc/sing-box/config.json").st_mode & 0o777, 0o600)
+            self.assertNotIn("restart sing-box", self._calls(calls))
 
     def test_service_start_failure_is_reported(self):
         """Scenario 16: Start failure must fail and not leave a masked service."""
@@ -868,6 +962,59 @@ exec /usr/bin/install "${args[@]}"
             self._fail(result)
             self._assert_unmasked(state)
             self._assert_not_active(state)
+
+    def test_state_directory_mode_0750_is_rejected_before_runtime_transition(self):
+        """A stale StateDirectoryMode=0750 must fail without restarting."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._state_dir_mode = "0750"
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("StateDirectoryMode is not 0755", result.stderr)
+            self._assert_active(state)
+            self._assert_not_interrupted(calls)
+
+    def test_vendor_unit_fragment_mismatch_is_rejected(self):
+        """The effective unit must be the package-owned vendor unit."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._fragment_path = "/etc/systemd/system/sing-box.service"
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("not the package-owned vendor unit", result.stderr)
+            self._assert_active(state)
+            self._assert_not_interrupted(calls)
+
+    def test_restart_failure_after_runtime_transition_restores_old_dropin(self):
+        """Recovery restarts only after a restart actually changed runtime state."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_wrong_override = True
+        self._was_active = True
+        self._was_enabled = True
+        self._restart_fail_once = True
+        old_dropin = (
+            "[Service]\nUser=root\nGroup=root\nExecStart=\n"
+            "ExecStart=/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run\n"
+        )
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self._assert_active(state)
+            dropin = fs / "etc/systemd/system/sing-box.service.d/override.conf"
+            self.assertEqual(dropin.read_text(), old_dropin)
+            lines = self._calls(calls)
+            self.assertEqual(
+                sum(1 for line in lines if line == "restart sing-box"),
+                2,
+                f"expected failed restart plus rollback restart: {lines}",
+            )
 
     def test_start_returning_zero_but_inactive_is_reported(self):
         """A zero exit from systemctl start is not sufficient runtime validation."""
@@ -904,6 +1051,33 @@ exec /usr/bin/install "${args[@]}"
             self._assert_enabled(state)
             self._assert_not_active(state)
             self.assertIn("stop sing-box", self._calls(calls))
+
+    def test_no_start_propagates_stop_failure(self):
+        """--no-start must not report success if the service remains active."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._was_enabled = True
+        self._stop_fails = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp, args=["--no-start"])
+            self._fail(result)
+            self.assertIn("still active despite --no-start", result.stderr)
+            self._assert_active(state)
+
+    def test_enable_failure_is_reported(self):
+        """Enablement failure must fail rather than silently leave disabled."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._enable_fails = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("Failed to enable sing-box", result.stderr)
+            self._assert_active(state)
 
     def test_repeated_execution(self):
         """Scenario 18: Repeated installer execution."""

@@ -224,6 +224,32 @@ bash sing-box/install-sing-box-debian.sh --key-file /root/sagernet.asc
 validates its fingerprint, and does not contact `sing-box.app/gpg.key` when the
 file is valid. Access to the official APT repository is still required.
 
+**Official package layout.** The SagerNet package-owned unit is
+`/usr/lib/systemd/system/sing-box.service` (or the equivalent `/lib` path). It
+has no maintainer scripts, no `User`/`Group`, no `StateDirectory`, and starts
+in directory mode with `-C /etc/sing-box`. The installer therefore owns the
+runtime identity and `ExecStart` through its drop-in, creates
+`/var/lib/sing-box` itself, and reloads/restarts the service itself after a
+package version change. The drop-in explicitly sets
+`StateDirectoryMode=0755`; the current vendor unit has no `StateDirectory`, so
+the installer also creates and normalizes `/var/lib/sing-box` directly, while
+any future vendor `StateDirectory` remains 0755 and a stale `0750` override is
+rejected. The package also ships
+`/etc/sing-box/config.json` as a dpkg conffile; APT installation uses
+`--force-confold` so existing configuration content is preserved. On a clean
+install the package supplies its sample configuration; use `--no-start` if the
+real configuration must be placed before the first start.
+
+A regular local unit at `/etc/systemd/system/sing-box.service` shadows the
+package unit. The installer refuses to make changes while such a unit exists
+and points to `sing-box/migrate-caddy-cert-paths.sh`, which validates, backs up
+and removes it. This avoids silently reporting an official installation while
+a local unit remains authoritative. Likewise, if the existing effective unit
+uses directory mode and the directory contains additional `*.json`/`*.jsonc`
+inputs, the installer fails before changes rather than silently dropping them
+by switching to `-c /etc/sing-box/config.json`; the migration helper already
+applies the same rule.
+
 **Unified systemd drop-in.** The vendor systemd unit remains unchanged. The
 installer removes previous sing-box service drop-ins from both
 `/etc/systemd/system/sing-box.service.d` and
@@ -235,6 +261,7 @@ installer removes previous sing-box service drop-ins from both
 [Service]
 User=www-data
 Group=www-data
+StateDirectoryMode=0755
 ExecStart=
 ExecStart=/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
 ```
@@ -262,7 +289,10 @@ The installer inspects and normalizes these paths on every run, not just
 on fresh installation. Ordinary files under managed directories are set to
 `0644`; persistent data is not deleted and file contents are not overwritten.
 Symlinks at managed paths are rejected. Permission metadata is snapshotted
-before normalization and restored if installation fails.
+before normalization and restored if installation fails. The accepted
+`0644` requirement makes `config.json` world-readable; deployments that store
+proxy credentials or private material in it must rely on stricter host access
+controls or revisit that requirement.
 
 **Service lifecycle.** The installer does **not** mask the service. A
 pre-existing mask is removed before installation proceeds and is not restored
@@ -270,13 +300,18 @@ on failure. The running service is not stopped for key, repository, package, or
 drop-in preparation. A restart occurs only when the systemd drop-in changed or
 the APT package version changed; an already-compliant rerun issues no
 `systemctl stop`, `start`, or `restart`. A previously stopped service is
-started after validation, and enablement is normalized.
+started after validation, and enablement is normalized. The inspected package
+control archive has no maintainer scripts, so package installation/upgrade
+does not itself stop, restart or enable sing-box.
 
 On failure, the installer restores the previous drop-ins, repository file and
 permission metadata, attempts to restore the prior active/enabled state, and
-reports the failure. Package upgrades are not rolled back automatically; if the
-package changed before a later failure, the previous unit configuration is
-restored and the service is restarted with the new package.
+reports the failure. A disk-only drop-in replacement or package upgrade is not
+treated as a runtime transition: if the healthy process was never restarted,
+rollback does not restart it. If the installer actually issued a start,
+restart or stop, rollback restores the prior unit files and applies them again.
+Package upgrades are not rolled back automatically and no package-version
+downgrade is attempted; the installed package remains in place.
 
 `--no-start` validates an existing `config.json` as `www-data`, leaves the
 service enabled and unmasked, and stops it. If `config.json` is absent, the
@@ -293,12 +328,24 @@ package unnecessarily, does not rewrite an already-correct drop-in or source
 file, and does not restart the service when the installation is already
 compliant. Existing configuration content and persistent state are preserved.
 
-Isolated regression tests: `python3 tests/test_sing_box_install.py`. These are
-**mocked** tests: they use fake `systemctl`, `apt-get`, `dpkg-query`, `curl`,
-`gpg`, and `runuser` commands in a temporary fake filesystem. They verify the
-control flow and resulting files, but they are not Debian/Ubuntu integration
-tests and do not prove APT repository, package, or live-systemd behavior. No
-live Debian/Ubuntu integration test is included in this PR.
+Isolated regression tests: `python3 tests/test_sing_box_install.py` (45 mocked
+cases). They use fake `systemctl`, `apt-get`, `dpkg-query`, `curl`, `gpg`, and
+`runuser` commands in a temporary fake filesystem. They verify control flow,
+rollback boundaries, local-unit/directory-mode guards, effective
+`StateDirectoryMode`/vendor-unit values and resulting files, but they are not
+Debian/Ubuntu integration tests and do not prove APT repository, package, or
+live-systemd behavior. No live Debian/Ubuntu integration test is included in
+this PR.
+
+**Follow-up validation.** Owner: repository maintainer. Trigger: before the
+next production sing-box deployment and after any change to the APT
+repository, package version, or systemd unit. Acceptance criteria: run on
+Debian 12 and Ubuntu 22.04/24.04 systems with systemd (fresh install, package
+upgrade, compliant rerun, `--no-start`, missing config, masked unit, local-unit
+shadowing and directory-mode extra inputs), recording `systemctl show` output,
+service state, file modes and installer exit status. Package-version rollback
+and the migration helper's separate `0750`/`0640` layout remain known
+limitations; the migration helper is not repaired in this PR.
 
 
 ## One-time migration of an old server
@@ -377,9 +424,9 @@ The same invocation also converts directory loading (`-C /etc/sing-box`) to:
 
 It works even when certificate paths are already correct. It requires the existing service to run as `www-data:www-data`, with a writable `/var/lib/sing-box`; use the identity converter below first if needed. Additional JSON/JSONC files in directory mode are listed and block conversion so effective inputs are not silently discarded. Move confirmed historical JSON inputs outside the directory before retrying.
 
-Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes the same `/etc/systemd/system/sing-box.service.d/override.conf` as the installer and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0750), state/log ownership and state-directory permissions according to its own documented helper layout (the APT installer itself uses 0755 directories and 0644 ordinary files). It reenables and starts/restarts the service, including previously disabled/inactive services.
+Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes its own `/etc/systemd/system/sing-box.service.d/override.conf` using the migration helper's `StateDirectoryMode=0750` layout and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0750), state/log ownership and state-directory permissions according to its own documented helper layout (the APT installer itself uses 0755 directories, 0644 ordinary files, `StateDirectoryMode=0755`, and removes all drop-ins). It reenables and starts/restarts the service, including previously disabled/inactive services.
 
-Configuration, the old local unit, drop-ins and permission metadata are backed up under `/root/sing-box-migration-backup/`. A switching/restart failure restores them and attempts to restore the previous enabled/active state. Already-correct enabled/active installations validate and skip changes/restart. It neither installs/upgrades packages nor modifies Caddy or `/home/tls`. Missing vendor units/certificates or conflicting unrelated drop-ins cause failure, rather than a success report for an incomplete layout.
+Configuration, the old local unit, drop-ins and permission metadata are backed up under `/root/sing-box-migration-backup/`. A switching/restart failure restores them and attempts to restore the previous enabled/active state. Already-correct enabled/active installations validate and skip changes/restart. It neither installs/upgrades packages nor modifies Caddy or `/home/tls`. Missing vendor units/certificates or conflicting unrelated drop-ins cause failure, rather than a success report for an incomplete layout. This helper still retains unrelated drop-ins and uses its `0750`/`0640` layout; that is a confirmed cross-script normalization gap relative to the APT installer's `0755`/`0644` all-drop-in normalization, recorded here but not repaired in this PR.
 
 ### 4. Install/standardize sing-box when needed
 
