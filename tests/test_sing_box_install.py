@@ -454,6 +454,16 @@ exec /usr/bin/install "${args[@]}"
             (fs / "etc/sing-box/extra.json").write_text('{"log":{"level":"debug"}}\n')
             (fs / "etc/sing-box/extra.jsonc").write_text('{"log":{"level":"warn"}}\n')
 
+        if getattr(self, "_state_executable", False):
+            executable = fs / "var/lib/sing-box/helper.sh"
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(executable, 0o755)
+
+        if getattr(self, "_state_nonexecutable", False):
+            data_file = fs / "var/lib/sing-box/state.db"
+            data_file.write_text("persistent state\n")
+            os.chmod(data_file, 0o600)
+
         if getattr(self, "_wrong_dir_perms", False):
             os.chmod(fs / "etc/sing-box", 0o700)
             os.chmod(fs / "var/lib/sing-box", 0o700)
@@ -712,6 +722,22 @@ exec /usr/bin/install "${args[@]}"
             result, base, fs, state, calls = self._run(tmp)
             self._succeed(result)
             self._assert_perms_correct(fs)
+
+    def test_preserves_executable_files(self):
+        """Executable files stay 0755 while ordinary files become 0644."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._state_executable = True
+        self._state_nonexecutable = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._succeed(result)
+            executable = fs / "var/lib/sing-box/helper.sh"
+            data_file = fs / "var/lib/sing-box/state.db"
+            self.assertEqual(os.stat(executable).st_mode & 0o777, 0o755)
+            self.assertEqual(os.stat(data_file).st_mode & 0o777, 0o644)
 
     def test_fixes_service_user(self):
         """Scenario 6: Different service user."""
@@ -1055,6 +1081,7 @@ exec /usr/bin/install "${args[@]}"
             self._assert_unmasked(state)
             self._assert_enabled(state)
             self._assert_not_active(state)
+            self.assertNotIn("stop sing-box", self._calls(calls))
 
     def test_no_start_existing(self):
         """Scenario 17b: --no-start on existing installation."""
@@ -1082,8 +1109,20 @@ exec /usr/bin/install "${args[@]}"
         with temporary_directory() as tmp:
             result, base, fs, state, calls = self._run(tmp, args=["--no-start"])
             self._fail(result)
-            self.assertIn("still active despite --no-start", result.stderr)
+            self.assertIn("Failed to stop sing-box for --no-start", result.stderr)
+            self.assertIn("stop sing-box", self._calls(calls))
             self._assert_active(state)
+
+    def test_no_start_does_not_stop_an_inactive_service(self):
+        """An already inactive service needs no stop command under --no-start."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp, args=["--no-start"])
+            self._succeed(result)
+            self._assert_not_active(state)
+            self.assertNotIn("stop sing-box", self._calls(calls))
 
     def test_enable_failure_is_reported(self):
         """Enablement failure must fail rather than silently leave disabled."""

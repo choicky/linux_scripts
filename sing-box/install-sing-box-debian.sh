@@ -496,10 +496,14 @@ restore_permissions(){
 }
 
 normalize_tree(){
-  local path=$1 owner=$2 dir_mode=$3 file_mode=$4
+  local path=$1 owner=$2 dir_mode=$3 file_mode=$4 file_exec_mode=$5
   [[ -e "$path" ]] || return 0
   find "$path" -xdev -type d -exec chmod "$dir_mode" {} +
-  find "$path" -xdev -type f -exec chmod "$file_mode" {} +
+  # Preserve the existing executable classification while normalizing modes.
+  # The first pass selects files with any execute bit before changing them; the
+  # second pass then cannot match those files.
+  find "$path" -xdev -type f -perm /111 -exec chmod "$file_exec_mode" {} +
+  find "$path" -xdev -type f ! -perm /111 -exec chmod "$file_mode" {} +
   find "$path" -xdev -type d -exec chown "$owner" {} +
   find "$path" -xdev -type f -exec chown "$owner" {} +
 }
@@ -509,23 +513,23 @@ normalize_permissions(){
 
   # /etc/sing-box/ -- root:www-data, 0755; ordinary files 0644.
   install -d -o root -g www-data -m 0755 /etc/sing-box
-  normalize_tree /etc/sing-box root:www-data 0755 0644
+  normalize_tree /etc/sing-box root:www-data 0755 0644 0755
 
-  # /var/lib/sing-box/ -- www-data:www-data, 0755; ordinary files 0644.
+  # /var/lib/sing-box/ -- www-data:www-data, 0755; files 0644 or 0755.
   install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
-  normalize_tree /var/lib/sing-box www-data:www-data 0755 0644
+  normalize_tree /var/lib/sing-box www-data:www-data 0755 0644 0755
 
   # /var/log/sing-box/ is normalized only when it already exists.
   if [[ -e /var/log/sing-box ]]; then
     install -d -o www-data -g www-data -m 0755 /var/log/sing-box
-    normalize_tree /var/log/sing-box www-data:www-data 0755 0644
+    normalize_tree /var/log/sing-box www-data:www-data 0755 0644 0755
   fi
 
-  # Systemd drop-in files -- root:root, 0644 (directory 0755).
+  # Systemd drop-in files -- root:root, 0644 or 0755 (directory 0755).
   install -d -o root -g root -m 0755 "$DROPIN_DIR"
-  normalize_tree "$DROPIN_DIR" root:root 0755 0644
+  normalize_tree "$DROPIN_DIR" root:root 0755 0644 0755
   if [[ -d "$RUN_DROPIN_DIR" ]]; then
-    normalize_tree "$RUN_DROPIN_DIR" root:root 0755 0644
+    normalize_tree "$RUN_DROPIN_DIR" root:root 0755 0644 0755
   fi
 
   # APT signing key and repository definition -- root:root, 0644.
@@ -620,7 +624,10 @@ reconcile_service(){
 
   if [[ "$NO_START" == true ]]; then
     ensure_service_enabled
-    service_stop >/dev/null 2>&1 || true
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+      service_stop >/dev/null 2>&1 \
+        || die "Failed to stop sing-box for --no-start."
+    fi
     [[ "$(systemctl is-active sing-box 2>/dev/null || true)" != "active" ]] \
       || die "sing-box is still active despite --no-start."
     log "sing-box is unmasked and enabled but not started (--no-start)."
