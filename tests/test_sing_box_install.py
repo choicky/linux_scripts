@@ -91,13 +91,16 @@ class InstallSingBoxTests(unittest.TestCase):
         (fs / "etc/os-release").write_text(os_release)
         (fs / "etc/ssl/certs/ca-certificates.crt").write_text("test CA bundle\n")
 
-        (fs / "usr/lib/systemd/system/sing-box.service").write_text(
+        vendor_unit = fs / "usr/lib/systemd/system/sing-box.service"
+        vendor_unit.write_text(
             "[Unit]\nDescription=sing-box service\n"
             "[Service]\nType=simple\nUser=sing-box\nGroup=sing-box\n"
             "StateDirectory=sing-box\n"
             "ExecStart=/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run\n"
             "[Install]\nWantedBy=multi-user.target\n"
         )
+        if getattr(self, "_vendor_unit_missing", False):
+            vendor_unit.unlink()
 
         check_exit = getattr(self, "_check_exit", 0)
         core = fs / "usr/bin/sing-box"
@@ -225,6 +228,7 @@ case "$1" in
       :
     elif [ '@RESTART_FAIL_ONCE@' = '1' ]; then
       touch '@STATE@/restart_attempted'
+      rm -f "$ACTIVE"
       touch "$FAILED"
       exit 1
     fi
@@ -977,6 +981,20 @@ exec /usr/bin/install "${args[@]}"
             self._assert_active(state)
             self._assert_not_interrupted(calls)
 
+    def test_missing_package_vendor_unit_is_rejected(self):
+        """An incomplete package layout must not be reported as normalized."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._vendor_unit_missing = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._fail(result)
+            self.assertIn("vendor unit is missing", result.stderr)
+            self._assert_active(state)
+            self._assert_not_interrupted(calls)
+
     def test_vendor_unit_fragment_mismatch_is_rejected(self):
         """The effective unit must be the package-owned vendor unit."""
         self._has_config = True
@@ -1012,9 +1030,10 @@ exec /usr/bin/install "${args[@]}"
             lines = self._calls(calls)
             self.assertEqual(
                 sum(1 for line in lines if line == "restart sing-box"),
-                2,
-                f"expected failed restart plus rollback restart: {lines}",
+                1,
+                f"failed restart stopped the process; rollback should start it: {lines}",
             )
+            self.assertIn("start sing-box", lines)
 
     def test_start_returning_zero_but_inactive_is_reported(self):
         """A zero exit from systemctl start is not sufficient runtime validation."""

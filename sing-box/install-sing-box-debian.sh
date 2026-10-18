@@ -597,8 +597,15 @@ service_start(){
 }
 
 service_restart(){
-  SERVICE_RUNTIME_TRANSITION=restarted
-  systemctl restart sing-box
+  # systemctl restart may stop the old process and fail to start the new one.
+  # Record the failed attempt separately so rollback can start again, while a
+  # failed restart that left the old process running is not restarted again.
+  SERVICE_RUNTIME_TRANSITION=restart_failed
+  if systemctl restart sing-box; then
+    SERVICE_RUNTIME_TRANSITION=restarted
+  else
+    return 1
+  fi
 }
 
 service_stop(){
@@ -677,6 +684,13 @@ rollback(){
           # the backed-up unit and apply it again.
           systemctl restart sing-box >/dev/null 2>&1 || failed=1
           ;;
+        restart_failed)
+          # A failed restart may have stopped the old process. If it is still
+          # running, it is the old process and must not be interrupted again.
+          if ! systemctl is-active --quiet sing-box 2>/dev/null; then
+            systemctl start sing-box >/dev/null 2>&1 || failed=1
+          fi
+          ;;
         started)
           if [[ "$DROPIN_CHANGED" == true ]]; then
             systemctl restart sing-box >/dev/null 2>&1 || failed=1
@@ -700,7 +714,7 @@ rollback(){
       systemctl is-active --quiet sing-box 2>/dev/null || failed=1
     else
       case "$SERVICE_RUNTIME_TRANSITION" in
-        started|restarted|stopped)
+        started|restarted|restart_failed|stopped)
           systemctl stop sing-box >/dev/null 2>&1 || failed=1
           ;;
         none)

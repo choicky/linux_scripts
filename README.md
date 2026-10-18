@@ -237,13 +237,14 @@ any future vendor `StateDirectory` remains 0755 and a stale `0750` override is
 rejected. The package also ships
 `/etc/sing-box/config.json` as a dpkg conffile; APT installation uses
 `--force-confold` so existing configuration content is preserved. On a clean
-install the package supplies its sample configuration; use `--no-start` if the
-real configuration must be placed before the first start.
+install the package supplies its sample configuration, and the installer will
+validate and start that sample unless `--no-start` is used; replace it first if
+the sample is not the intended production configuration.
 
 A regular local unit at `/etc/systemd/system/sing-box.service` shadows the
 package unit. The installer refuses to make changes while such a unit exists
 and points to `sing-box/migrate-caddy-cert-paths.sh`, which validates, backs up
-and removes it. This avoids silently reporting an official installation while
+and removes it once the running service is on `www-data:www-data`. This avoids silently reporting an official installation while
 a local unit remains authoritative. Likewise, if the existing effective unit
 uses directory mode and the directory contains additional `*.json`/`*.jsonc`
 inputs, the installer fails before changes rather than silently dropping them
@@ -308,10 +309,11 @@ On failure, the installer restores the previous drop-ins, repository file and
 permission metadata, attempts to restore the prior active/enabled state, and
 reports the failure. A disk-only drop-in replacement or package upgrade is not
 treated as a runtime transition: if the healthy process was never restarted,
-rollback does not restart it. If the installer actually issued a start,
-restart or stop, rollback restores the prior unit files and applies them again.
-Package upgrades are not rolled back automatically and no package-version
-downgrade is attempted; the installed package remains in place.
+rollback does not restart it. Where a start, restart or stop actually changed
+runtime state, rollback restores the prior unit files and applies them again;
+a failed restart that left the old process running is not restarted. Package
+upgrades are not rolled back automatically and no package-version downgrade is
+attempted; the installed package remains in place.
 
 `--no-start` validates an existing `config.json` as `www-data`, leaves the
 service enabled and unmasked, and stops it. If `config.json` is absent, the
@@ -328,7 +330,7 @@ package unnecessarily, does not rewrite an already-correct drop-in or source
 file, and does not restart the service when the installation is already
 compliant. Existing configuration content and persistent state are preserved.
 
-Isolated regression tests: `python3 tests/test_sing_box_install.py` (45 mocked
+Isolated regression tests: `python3 tests/test_sing_box_install.py` (46 mocked
 cases). They use fake `systemctl`, `apt-get`, `dpkg-query`, `curl`, `gpg`, and
 `runuser` commands in a temporary fake filesystem. They verify control flow,
 rollback boundaries, local-unit/directory-mode guards, effective
