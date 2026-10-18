@@ -83,25 +83,25 @@ cat >/etc/systemd/system/sing-box.service.d/override.conf <<'EOF'
 [Service]
 User=www-data
 Group=www-data
-StateDirectoryMode=0750
+StateDirectoryMode=0755
 EOF
 
 log "Updating ownership"
 install -d -o www-data -g www-data -m 0700 /var/lib/caddy
 chown -R www-data:www-data /var/lib/caddy
-install -d -o www-data -g www-data -m 0750 /var/log/caddy
+install -d -o www-data -g www-data -m 0755 /var/log/caddy
 chown -R www-data:www-data /var/log/caddy
 chown root:www-data /etc/caddy "$CADDY_CONFIG"
-chmod 0750 /etc/caddy
+chmod 0755 /etc/caddy
 chmod 0640 "$CADDY_CONFIG"
 
-install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
+install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
 chown -R www-data:www-data /var/lib/sing-box
 if [[ -d /var/log/sing-box ]]; then
   chown -R www-data:www-data /var/log/sing-box
 fi
 chown root:www-data /etc/sing-box "$SINGBOX_CONFIG"
-chmod 0750 /etc/sing-box
+chmod 0755 /etc/sing-box
 chmod 0640 "$SINGBOX_CONFIG"
 
 systemctl daemon-reload

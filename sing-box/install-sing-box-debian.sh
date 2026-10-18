@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the stable sing-box package from the official APT repository on Debian 12/13.
+# Install the stable sing-box package from the official APT repository on Debian 12/13 or Ubuntu.
 # This script deliberately installs "sing-box", never "sing-box-beta".
 # Keep the vendor systemd unit; override the runtime identity and config path.
 set -Eeuo pipefail
@@ -56,11 +56,16 @@ parse_args(){
 preflight(){
   [[ ${EUID} -eq 0 ]] || die "Run this script as root."
   . /etc/os-release
-  [[ ${ID:-} == debian ]] || die "Only Debian is supported."
-  case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
+  case "${ID:-}" in
+    debian)
+      case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
+      ;;
+    ubuntu) ;;
+    *) die "Only Debian 12/13 and Ubuntu are supported." ;;
+  esac
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
-  log "Environment: Debian ${VERSION_ID}, architecture: $(dpkg --print-architecture)"
+  log "Environment: ${ID} ${VERSION_ID}, architecture: $(dpkg --print-architecture)"
 }
 
 install_key(){
@@ -128,7 +133,7 @@ setup_service(){
 [Service]
 User=www-data
 Group=www-data
-StateDirectoryMode=0750
+StateDirectoryMode=0755
 ExecStart=
 ExecStart=/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
 EOF
@@ -139,7 +144,7 @@ prepare_paths(){
   # StateDirectory=sing-box in the vendor unit would otherwise create/repair
   # /var/lib/sing-box for the vendor User=sing-box. With the User override,
   # keep the state directory explicitly owned by the selected runtime identity.
-  install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
+  install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
   chown -R www-data:www-data /var/lib/sing-box
   chmod -R u+rwX /var/lib/sing-box
   # Existing deployments commonly write access/error logs here. Convert the
@@ -147,7 +152,7 @@ prepare_paths(){
   if [[ -d /var/log/sing-box ]]; then
     chown -R www-data:www-data /var/log/sing-box
   fi
-  install -d -o root -g www-data -m 0750 /etc/sing-box
+  install -d -o root -g www-data -m 0755 /etc/sing-box
   if [[ -f "$CONFIG" ]]; then
     chown root:www-data "$CONFIG"
     chmod 0640 "$CONFIG"

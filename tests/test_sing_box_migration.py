@@ -50,7 +50,7 @@ printf '%s\\n' "$*" >> '{calls}'
 case "$1" in
 show)
  case "$*" in
- *StateDirectoryMode*) if grep -q '^StateDirectoryMode=0750$' '{drop}' 2>/dev/null; then echo 0750; else echo 0755; fi;;
+ *StateDirectoryMode*) if grep -q '^StateDirectoryMode=0755$' '{drop}' 2>/dev/null; then echo 0755; else echo 0755; fi;;
  *FragmentPath*) if [[ -f '{main}' ]]; then echo '{main}'; else echo '{vendor}'; fi;;
  *ExecStart*)
   if [[ '{str(single).lower()}' == true ]] || grep -q 'ExecStart=' '{drop}' 2>/dev/null; then cmd='{expected}'; else cmd='{directory}'; fi
@@ -65,14 +65,14 @@ stop) rm -f '{active}';;
 restart)
  if [[ '{str(fail_restart).lower()}' == true && ! -f '{restarted}' ]]; then touch '{restarted}'; exit 9; fi
  touch '{active}'
- if grep -q '^StateDirectoryMode=0750$' '{drop}' 2>/dev/null; then chmod 750 '{fs}/var/lib/sing-box'; else chmod 755 '{fs}/var/lib/sing-box'; fi;;
+ if grep -q '^StateDirectoryMode=0755$' '{drop}' 2>/dev/null; then chmod 755 '{fs}/var/lib/sing-box'; else chmod 755 '{fs}/var/lib/sing-box'; fi;;
 cat) echo ORIGINAL_SERVICE;;
 esac
 '''
             (bins/'systemctl').write_text(systemctl)
             (bins/'runuser').write_text('#!/bin/bash\nshift 3\nexec "$@"\n')
             (bins/'chown').write_text('#!/bin/sh\nexit 0\n')
-            (bins/'stat').write_text('#!/bin/bash\ncase "$*" in *"/var/lib/sing-box") echo www-data:www-data:$(/usr/bin/stat -c %a "${@: -1}");; *"/etc/sing-box") echo root:www-data:750;; *) echo root:www-data:$(/usr/bin/stat -c %a "${@: -1}");; esac\n')
+            (bins/'stat').write_text('#!/bin/bash\ncase "$*" in *"/var/lib/sing-box") echo www-data:www-data:$(/usr/bin/stat -c %a "${@: -1}");; *"/etc/sing-box") echo root:www-data:755;; *) echo root:www-data:$(/usr/bin/stat -c %a "${@: -1}");; esac\n')
             (bins/'dpkg-query').write_text('#!/bin/bash\ncase "$*" in *sing-box-beta*) exit 1;; *-L*) echo "'+str(vendor)+'";; *) printf "install ok installed\\n";; esac\n')
             (bins/'install').write_text('#!/bin/bash\nargs=(); while (( $# )); do case "$1" in -o|-g) shift 2;; *) args+=("$1"); shift;; esac; done\nexec /usr/bin/install "${args[@]}"\n')
             (bins/'sleep').write_text('#!/bin/sh\nexit 0\n')
@@ -101,7 +101,7 @@ esac
                 self.assertFalse(obsolete.exists())
                 self.assertTrue(enabled.exists())
                 self.assertTrue(active.exists())
-                self.assertEqual((fs/'var/lib/sing-box').stat().st_mode & 0o777,0o750)
+                self.assertEqual((fs/'var/lib/sing-box').stat().st_mode & 0o777,0o755)
                 # Second execution must validate and perform no restart.
                 count=calls.read_text().count('restart')
                 again=subprocess.run(['bash',str(local)],env=env,capture_output=True,text=True)

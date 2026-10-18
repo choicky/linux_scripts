@@ -149,9 +149,9 @@ prepare_paths(){
   # access Caddy-managed certificates without ACLs or permission-sync scripts.
   install -d -o www-data -g www-data -m 0700 /var/lib/caddy
   chown -R www-data:www-data /var/lib/caddy
-  install -d -o www-data -g www-data -m 0750 /var/log/caddy
+  install -d -o www-data -g www-data -m 0755 /var/log/caddy
   chown -R www-data:www-data /var/log/caddy
-  chown root:www-data /etc/caddy; chmod 0750 /etc/caddy
+  chown root:www-data /etc/caddy; chmod 0755 /etc/caddy
   if [[ -f "$CONFIG" ]]; then chown root:www-data "$CONFIG"; chmod 0640 "$CONFIG"; fi
 }
 

@@ -100,8 +100,8 @@ for ref in "${refs[@]}"; do
 done
 log 'Validating candidate as www-data'
 runuser -u www-data -- /usr/bin/sing-box -D /var/lib/sing-box check -c "$WORK/config.json" || die 'Candidate validation failed; live config/startup unchanged.'
-printf '[Service]\nUser=www-data\nGroup=www-data\nStateDirectoryMode=0750\nExecStart=\nExecStart=%s\n' "$EXPECTED" > "$WORK/launch.conf"
-if [[ ! -e "$DROPIN_DIR/zzzz-single-file.conf" && ! -e "$DROPIN_DIR/zzzz-caddy-single-file.conf" && ! -e "$LOCAL_UNIT" && "$ENABLED" == true && "$ACTIVE" == true && "$(systemctl show sing-box -p StateDirectoryMode --value)" == 0750 && "$(readlink -f "$(systemctl show sing-box -p FragmentPath --value)")" == "$(readlink -f "$VENDOR")" && "$(stat -c '%U:%G:%a' /etc/sing-box)" == root:www-data:750 && "$(stat -c '%U:%G:%a' /var/lib/sing-box)" == www-data:www-data:750 ]] && cmp -s "$DROPIN" "$WORK/launch.conf" && cmp -s "$CONFIG" "$WORK/config.json" && [[ "$START" == *"argv[]=$EXPECTED ;"* && "$(stat -c '%U:%G:%a' "$CONFIG")" == root:www-data:640 ]]; then
+printf '[Service]\nUser=www-data\nGroup=www-data\nStateDirectoryMode=0755\nExecStart=\nExecStart=%s\n' "$EXPECTED" > "$WORK/launch.conf"
+if [[ ! -e "$DROPIN_DIR/zzzz-single-file.conf" && ! -e "$DROPIN_DIR/zzzz-caddy-single-file.conf" && ! -e "$LOCAL_UNIT" && "$ENABLED" == true && "$ACTIVE" == true && "$(systemctl show sing-box -p StateDirectoryMode --value)" == 0755 && "$(readlink -f "$(systemctl show sing-box -p FragmentPath --value)")" == "$(readlink -f "$VENDOR")" && "$(stat -c '%U:%G:%a' /etc/sing-box)" == root:www-data:755 && "$(stat -c '%U:%G:%a' /var/lib/sing-box)" == www-data:www-data:755 ]] && cmp -s "$DROPIN" "$WORK/launch.conf" && cmp -s "$CONFIG" "$WORK/config.json" && [[ "$START" == *"argv[]=$EXPECTED ;"* && "$(stat -c '%U:%G:%a' "$CONFIG")" == root:www-data:640 ]]; then
   log 'Already normalized; no files changed and no service restart.'
   exit 0
 fi
@@ -119,8 +119,8 @@ log "Backup: $BACKUP"
 CHANGED=true
 [[ "$ACTIVE" == false ]] || systemctl stop sing-box
 # Match install-sing-box-debian.sh permissions and service layout.
-install -d -o root -g www-data -m 0750 /etc/sing-box
-install -d -o www-data -g www-data -m 0750 /var/lib/sing-box
+install -d -o root -g www-data -m 0755 /etc/sing-box
+install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
 chown -R www-data:www-data /var/lib/sing-box
 chmod -R u+rwX /var/lib/sing-box
 if [[ -d /var/log/sing-box ]]; then chown -R www-data:www-data /var/log/sing-box; fi
@@ -135,13 +135,13 @@ START="$(systemctl show sing-box -p ExecStart --value)"
 [[ "$(readlink -f "$(systemctl show sing-box -p FragmentPath --value)")" == "$(readlink -f "$VENDOR")" ]] || die 'Vendor unit did not take effect.'
 [[ "$START" == *"argv[]=$EXPECTED ;"* ]] || die 'Single-file override did not take effect.'
 [[ "$(systemctl show sing-box -p User --value)" == www-data && "$(systemctl show sing-box -p Group --value)" == www-data ]] || die 'Unexpected runtime identity.'
-[[ "$(systemctl show sing-box -p StateDirectoryMode --value)" == 0750 ]] || die 'StateDirectoryMode override did not take effect.'
+[[ "$(systemctl show sing-box -p StateDirectoryMode --value)" == 0755 ]] || die 'StateDirectoryMode override did not take effect.'
 systemctl reenable sing-box
 systemctl is-enabled --quiet sing-box || die 'sing-box not enabled.'
 systemctl restart sing-box
 sleep 3
 systemctl is-active --quiet sing-box || die 'sing-box failed after restart.'
-[[ "$(stat -c '%U:%G:%a' /var/lib/sing-box)" == www-data:www-data:750 ]] || die 'Unexpected state-directory ownership/mode after restart.'
+[[ "$(stat -c '%U:%G:%a' /var/lib/sing-box)" == www-data:www-data:755 ]] || die 'Unexpected state-directory ownership/mode after restart.'
 CHANGED=false
 log 'SUCCESS: vendor unit, permissions, certificate paths and single-file startup normalized.'
 systemctl show sing-box -p FragmentPath -p User -p Group -p ExecStart -p UnitFileState --no-pager

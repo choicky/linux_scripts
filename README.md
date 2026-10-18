@@ -216,7 +216,11 @@ The vendor systemd unit remains unchanged. The installer writes
 The sole production configuration is `/etc/sing-box/config.json`
 (`root:www-data`, 0640). Other JSON files in `/etc/sing-box/`, including old,
 test and backup configurations, are not automatically loaded by systemd.
-The service override sets `StateDirectoryMode=0750`, matching the directory permissions prepared by the installer and preventing systemd from resetting them on startup. Installation, identity conversion and normalization all use this setting.
+The service override sets `StateDirectoryMode=0755`, matching the directory
+permissions prepared by the installer. Installation, identity conversion and
+normalization all use this setting. Caddy and sing-box configuration directories
+use 0755; configuration files retain `root:www-data`, 0640.
+The sing-box installer supports Debian 12/13 and Ubuntu.
 Existing state/cache files under `/var/lib/sing-box` are made writable by
 `www-data:www-data`.
 
@@ -312,7 +316,7 @@ The same invocation also converts directory loading (`-C /etc/sing-box`) to:
 
 It works even when certificate paths are already correct. It requires the existing service to run as `www-data:www-data`, with a writable `/var/lib/sing-box`; use the identity converter below first if needed. Additional JSON/JSONC files in directory mode are listed and block conversion so effective inputs are not silently discarded. Move confirmed historical JSON inputs outside the directory before retrying.
 
-Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes the same `/etc/systemd/system/sing-box.service.d/override.conf` as the installer and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0750), state/log ownership and state-directory permissions to match the installer. It reenables and starts/restarts the service, including previously disabled/inactive services.
+Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes the same `/etc/systemd/system/sing-box.service.d/override.conf` as the installer and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0755), state/log ownership and state-directory permissions to match the installer. It reenables and starts/restarts the service, including previously disabled/inactive services.
 
 Configuration, the old local unit, drop-ins and permission metadata are backed up under `/root/sing-box-migration-backup/`. A switching/restart failure restores them and attempts to restore the previous enabled/active state. Already-correct enabled/active installations validate and skip changes/restart. It neither installs/upgrades packages nor modifies Caddy or `/home/tls`. Missing vendor units/certificates or conflicting unrelated drop-ins cause failure, rather than a success report for an incomplete layout.
 
