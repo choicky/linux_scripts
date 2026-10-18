@@ -14,15 +14,20 @@ Personal Linux server administration and deployment scripts.
 
 ## Components
 
-- `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary.
-- `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified.
-- `caddy/migrate-caddy-debian.sh` — one-time migration from the old manual Caddy layout.
-- `caddy/convert-services-to-www-data.sh` — one-time compatibility helper for servers migrated with the earlier runtime-user layout.
+Caddy lifecycle is three entry points plus one shared component. Install,
+update and migration all delegate service/runtime reconciliation to the same
+normalizer, so managed systemd drop-ins and permissions are authored in exactly
+one place and cannot drift apart.
+
+- `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary. Delegates runtime reconciliation to the normalizer.
+- `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified. Normalizes service state on every path, including when the package is already current.
+- `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
+- `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, and reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
-- `sing-box/migrate-caddy-cert-paths.sh` — migrate certificate paths and normalize existing sing-box startup to a single config file without reinstalling packages.
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
+
 
 ## System tools
 
@@ -150,6 +155,24 @@ The custom Caddy binary includes:
 
 JSONC support is built into current Caddy and does not require a separate adapter module.
 
+The shared normalizer (`caddy/normalize-caddy-services.sh`) is the single
+authority for the managed Caddy service state. Its target layout is:
+
+| Path | Owner:Group | Mode |
+|---|---|---|
+| `/etc/caddy/` | `root:www-data` | `0750` |
+| `/etc/caddy/caddy.jsonc` | `root:www-data` | `0640` |
+| `/var/lib/caddy/` (and storage) | `www-data:www-data` | `0700` |
+| `/var/log/caddy/` | `www-data:www-data` | `0750` |
+| `/etc/systemd/system/caddy.service.d/override.conf` | `root:root` | `0644` |
+
+Caddy state stays restrictive (`0700`/`0750`/`0640`) because it holds private
+keys, while sing-box uses the installer's `0755`/`0644` layout and reads the
+certificates through the shared `www-data` group. The managed drop-in sets
+`User`/`Group=www-data`, `Environment=HOME=/var/lib/caddy` and a
+`--config /etc/caddy/caddy.jsonc --adapter jsonc` `ExecStart`/`ExecReload`; the
+vendor/package unit is otherwise left unchanged.
+
 ## Clean installation
 
 For a new Debian 12/13 or Ubuntu server that does not have the old manual Caddy layout:
@@ -242,14 +265,18 @@ validate and start that sample unless `--no-start` is used; replace it first if
 the sample is not the intended production configuration.
 
 A regular local unit at `/etc/systemd/system/sing-box.service` shadows the
-package unit. The installer refuses to make changes while such a unit exists
-and points to `sing-box/migrate-caddy-cert-paths.sh`, which validates, backs up
-and removes it once the running service is on `www-data:www-data`. This avoids silently reporting an official installation while
-a local unit remains authoritative. Likewise, if the existing effective unit
+package unit. The installer refuses to make changes while such a unit exists.
+Its error message still names the deleted helper
+`sing-box/migrate-caddy-cert-paths.sh` (that message is part of the frozen
+sing-box installer and is a documented limitation); the script that actually
+handles this now is `caddy/migrate-caddy-deployment.sh`, which validates,
+backs up and removes the shadowing unit before normalization, so the package
+unit stays authoritative instead of an official installation being reported
+while a local unit remains in control. Likewise, if the existing effective unit
 uses directory mode and the directory contains additional `*.json`/`*.jsonc`
 inputs, the installer fails before changes rather than silently dropping them
-by switching to `-c /etc/sing-box/config.json`; the migration helper already
-applies the same rule.
+by switching to `-c /etc/sing-box/config.json`; the migration and normalization
+scripts apply the same rule.
 
 **Unified systemd drop-in.** The vendor systemd unit remains unchanged. The
 installer removes previous sing-box service drop-ins from both
@@ -351,22 +378,34 @@ Debian 12 and Ubuntu 22.04/24.04 systems with systemd (fresh install, package
 upgrade, compliant rerun, `--no-start`, missing config, masked unit, local-unit
 shadowing and directory-mode extra inputs), recording `systemctl show` output,
 service state, file modes and installer exit status. Package-version rollback
-and the migration helper's separate `0750`/`0640` layout remain known
-limitations; the migration helper is not repaired in this PR.
+remains a known limitation. The former cross-script normalization gap (the
+deleted sing-box migration helper used its own `0750`/`0640` layout instead of
+the installer's `0755`/`0644`) is closed by the consolidation: sing-box
+reconciliation now runs through the shared normalizer, so there is only one
+layout.
 
 
 ## One-time migration of an old server
 
-This procedure is for servers using the legacy layout:
+This procedure is for servers using a legacy layout, for example:
 
 ```text
 Caddy binary:  /usr/local/bin/caddy
 Caddy unit:    /etc/systemd/system/caddy.service
 Caddy config:  /etc/caddy/caddy.jsonc
 Caddy storage: /home/tls
+sing-box:      a local /etc/systemd/system/sing-box.service shadowing the
+               package unit, and/or certificate_path/key_path references
+               still pointing into the legacy storage root
 ```
 
-The migration intentionally keeps `/home/tls` and a timestamped backup so rollback remains possible.
+`/home/tls` is the historical example, not a hardcoded assumption: legacy
+storage roots are detected from first-hand evidence (a `file_system` storage
+`root` in the Caddy config backed by real `acme/` **and** `certificates/`
+directories, or an implicit default root derived from a legacy unit's
+`Environment=HOME=`). Ambiguous evidence (a partial root, several roots, an
+existing standard storage, leftover references outside certificate fields)
+stops the migration before any change instead of guessing.
 
 ### 1. Update this repository
 
@@ -382,60 +421,55 @@ git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
 cd /root/linux_scripts
 ```
 
-### 2. Migrate Caddy
+### 2. Migrate the deployment (Caddy and sing-box)
 
 ```bash
-bash caddy/migrate-caddy-debian.sh
+bash caddy/migrate-caddy-deployment.sh
 ```
 
-The script:
+The script performs the whole one-time migration in order and delegates
+package installation and runtime reconciliation instead of duplicating it:
 
-1. verifies the expected old layout;
-2. backs up the old Caddy binary, unit and configuration under `/root/caddy-migration-backup/<timestamp>`;
-3. retains `/home/tls` in place;
-4. installs Caddy Stable from the official APT repository;
-5. downloads and verifies the matching prebuilt custom Caddy release;
-6. registers the stock/custom binaries using dpkg-divert;
-7. copies Caddy storage to `/var/lib/caddy/.local/share/caddy`;
-8. rewrites only Caddy's FileStorage root;
-9. validates and starts Caddy;
-10. reports any remaining sing-box references to `/home/tls`.
+1. detects the legacy layout from evidence and refuses ambiguous states before
+   touching anything (a shadowing sing-box local unit is handled only when the
+   package-owned unit exists to fall back to);
+2. classifies sing-box certificate references into legacy-root-mapped,
+   external and residual (residual stops the run);
+3. backs up binaries, units, drop-ins, configurations, sing-box state and a
+   permission manifest under `/root/caddy-migration-backup/<timestamp>`;
+4. stops and removes the legacy Caddy paths so the package unit becomes
+   authoritative; the legacy storage root is retained in place, never moved;
+5. reruns `caddy/install-caddy-debian.sh --no-start` for the official APT
+   package, the matching custom binary, dpkg-divert registration and the
+   managed drop-ins;
+6. copies the legacy storage into `/var/lib/caddy/.local/share/caddy` and
+   rewrites only Caddy's FileStorage `root` (an implicit default root needs no
+   rewrite because the managed drop-in sets `HOME=/var/lib/caddy`);
+7. rewrites only `certificate_path`/`key_path` fields that follow the verified
+   old-root → standard-root mapping, keeps explicit external PEM references in
+   place, requires every referenced file to exist and be readable by
+   `www-data`, and validates the sing-box candidate as `www-data` before
+   applying it;
+8. backs up and removes a shadowing `/etc/systemd/system/sing-box.service` so
+   the package unit wins (`--skip-sing-box` leaves sing-box entirely untouched
+   and narrows normalization to `--caddy`);
+9. calls the shared normalizer once (`normalize-caddy-services.sh --both`) to
+   reconcile both services, drop-ins and permissions;
+10. validates the migrated Caddy configuration as `www-data`, then activates
+    exactly once: a service that was running before is restarted, a
+    stopped/disabled service is left stopped/disabled.
 
-Do not delete `/home/tls` after this step.
+If any step fails after changes were applied, the script restores the
+pre-migration files, units, drop-ins, permission metadata and prior service
+activity. Rollback does not downgrade APT packages and may leave a created
+dpkg diversion in place (it is reported). Do not delete the retained legacy
+storage root (such as `/home/tls`) after this step; verify and archive it
+manually when you decide.
 
-### 3. Normalize existing sing-box configuration and startup
+Re-running the script on a finished migration finds no legacy evidence and
+exits without changes, pointing to the normalizer for routine reconciliation.
 
-Run:
-
-```bash
-bash sing-box/migrate-caddy-cert-paths.sh
-```
-
-This helper rewrites `certificate_path` and `key_path` entries from:
-
-```text
-/home/tls/...
-```
-
-to:
-
-```text
-/var/lib/caddy/.local/share/caddy/...
-```
-
-The same invocation also converts directory loading (`-C /etc/sing-box`) to:
-
-```text
-/usr/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
-```
-
-It works even when certificate paths are already correct. It requires the existing service to run as `www-data:www-data`, with a writable `/var/lib/sing-box`; use the identity converter below first if needed. Additional JSON/JSONC files in directory mode are listed and block conversion so effective inputs are not silently discarded. Move confirmed historical JSON inputs outside the directory before retrying.
-
-Before changing live files, it requires the installed Stable package and a package-owned vendor unit, checks certificate/key readability, and validates the candidate as `www-data`. It backs up and removes `/etc/systemd/system/sing-box.service` so the vendor unit is selected. It writes its own `/etc/systemd/system/sing-box.service.d/override.conf` using the migration helper's `StateDirectoryMode=0750` layout and retires the older generated `zzzz-single-file.conf` / `zzzz-caddy-single-file.conf`, retaining unrelated drop-ins. It normalizes config ownership/mode (`root:www-data`, 0640), the config directory (0750), state/log ownership and state-directory permissions according to its own documented helper layout (the APT installer itself uses 0755 directories, 0644 non-executable files, 0755 executable files, `StateDirectoryMode=0755`, and removes all drop-ins). It reenables and starts/restarts the service, including previously disabled/inactive services.
-
-Configuration, the old local unit, drop-ins and permission metadata are backed up under `/root/sing-box-migration-backup/`. A switching/restart failure restores them and attempts to restore the previous enabled/active state. Already-correct enabled/active installations validate and skip changes/restart. It neither installs/upgrades packages nor modifies Caddy or `/home/tls`. Missing vendor units/certificates or conflicting unrelated drop-ins cause failure, rather than a success report for an incomplete layout. This helper still retains unrelated drop-ins and uses its `0750`/`0640` layout; that is a confirmed cross-script normalization gap relative to the APT installer's `0755`/`0644` all-drop-in normalization, recorded here but not repaired in this PR.
-
-### 4. Install/standardize sing-box when needed
+### 3. Install/standardize sing-box when needed
 
 For servers that do not yet use the official Stable APT package, run:
 
@@ -445,21 +479,35 @@ bash sing-box/install-sing-box-debian.sh
 
 The installer uses the official SagerNet APT repository and installs `sing-box`, never `sing-box-beta`. It retains the vendor systemd unit and uses a unified drop-in to run as `www-data:www-data` with `-c /etc/sing-box/config.json` (single file, not directory mode). It normalizes filesystem permissions (directories 0755, non-executable files 0644, executable files 0755), removes all existing drop-ins, and does not mask the service. See the installation and recovery options above.
 
-If the server already has the correct official Stable package and service, do not reinstall it merely for the certificate-path migration.
+If the server already has the correct official Stable package and service, do not reinstall it merely for the certificate-path migration; step 2 handled the references and the shared normalizer reconciles the startup layout.
 
-### 5. Compatibility conversion for previously migrated servers
+### 4. Reconcile previously migrated servers
 
-Servers that were migrated with an earlier version of these scripts may still run Caddy and/or sing-box as another service account. For those servers only:
+Servers migrated with an earlier version of these scripts may still run
+Caddy and/or sing-box under another service account or have drifted from the
+managed layout. For those servers:
 
 ```bash
-bash caddy/convert-services-to-www-data.sh
+bash caddy/normalize-caddy-services.sh --both
 ```
 
-This changes both services to `www-data:www-data`, fixes Caddy/sing-box state and log ownership, validates both configurations as `www-data`, and restarts the services.
+This is the same shared component that install, update and migration call. It
+runs both services as `www-data:www-data` (so sing-box reads Caddy storage
+certificates directly — no copying, ACLs or sync daemons), fixes Caddy/sing-box
+state and log ownership, validates a running service's configuration as
+`www-data` before restarting it, and restarts a service only when its unit
+definition actually changed. A stopped/disabled service stays
+stopped/disabled; a compliant layout produces no changes at all. Use `--caddy`
+or `--sing-box` to reconcile a single service. On failure it restores the
+drop-ins it applied and replays the permission manifest, retaining the backup
+directory it reports under `/run/normalize-caddy-services.*`.
 
-A server migrated from scratch with the current scripts normally does not need this compatibility step if both services already show the expected runtime identities.
+The normalizer deliberately refuses to work while a local
+`/etc/systemd/system/sing-box.service` shadows the package unit (and while a
+Caddy package unit is shadowed by a local unit). That backup-and-remove duty
+belongs to the one-time migration in step 2.
 
-### 6. Final verification
+### 5. Final verification
 
 ```bash
 echo '=== services ==='
@@ -517,16 +565,27 @@ bash caddy/update-caddy-debian.sh
 The updater deliberately prepares the custom binary **before** changing the APT package. It:
 
 1. refreshes APT metadata and reads the Caddy Stable candidate version;
-2. exits without restarting Caddy when the installed APT version is already current;
+2. when the installed APT version is already current, still reconciles the managed
+   service state via the normalizer and then exits without restarting Caddy (it does
+   not short-circuit before normalization);
 3. downloads the exactly matching `caddy-linux-amd64` or `caddy-linux-arm64` release and `SHA256SUMS` from `choicky/caddy-custom-build`;
 4. verifies SHA256, version, `caddy-l4`, `caddy-cloudflare-ip`, and built-in JSONC support;
 5. validates the current JSONC configuration with the new custom binary as `www-data`;
 6. only then stops/masks Caddy and upgrades the official APT package;
 7. verifies that `/usr/bin/caddy.default` matches the prepared custom version;
-8. replaces `/usr/bin/caddy.custom`, validates again, and restarts Caddy;
+8. replaces `/usr/bin/caddy.custom`, reconciles the managed service state with the
+   normalizer, validates again, and restarts Caddy once;
 9. restores the previous custom binary and attempts to restart the previous runtime if a failure occurs after Caddy has been stopped.
 
 If the matching custom GitHub Release does not exist yet, the script stops **before** changing the installed APT package or running service. Build/release that Caddy version first, then rerun the updater.
+
+**APT protection is deliberately minimum-sufficient.** The preflight requires the
+`dpkg-divert` of the stock binary and the `/usr/bin/caddy` symlink to the custom
+binary, and normalization re-asserts them. A plain `apt upgrade` therefore moves
+the stock package behind the diversion while the verified custom binary stays
+selected. The updater intentionally uses **no** `apt-mark hold` and **no** APT
+pinning: either would block the stock security updates whose candidate version is
+the updater's source of truth for which custom release to fetch.
 
 Do not use `install-caddy-debian.sh` as the normal upgrade command once the standard layout is installed.
 
@@ -534,15 +593,17 @@ Do not use `install-caddy-debian.sh` as the normal upgrade command once the stan
 
 After a migration, keep these rollback materials until the server has been stable and its proxy/web services have been tested:
 
-- `/home/tls`
-- `/root/caddy-migration-backup/<timestamp>`
-- `/root/sing-box-migration-backup/*` configuration/startup backups (older versions used `/etc/sing-box/config.json.before-caddy-storage-migration-*`)
+- the retained legacy storage root (for example `/home/tls`)
+- `/root/caddy-migration-backup/<timestamp>` — this single timestamped directory now
+  also holds the sing-box configuration, the old shadowing sing-box local unit,
+  drop-ins and the permission manifest that the removed helper used to write to
+  `/root/sing-box-migration-backup/*`
 
 Do not remove `/home/tls` while any service or configuration still references it.
 
 ## Already migrated servers
 
-For servers such as those migrated with an earlier script revision, first update the repository and then run the compatibility conversion only if the effective service users are not already correct:
+For servers such as those migrated with an earlier script revision, first update the repository and then run the shared normalizer only if the effective service identities have drifted:
 
 ```bash
 cd /root/linux_scripts
@@ -554,12 +615,12 @@ systemctl show sing-box -p User -p Group
 If required:
 
 ```bash
-bash caddy/convert-services-to-www-data.sh
+bash caddy/normalize-caddy-services.sh --both
 ```
 
-Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy + /home/tls` layout has already been migrated.
+Do not rerun `caddy/migrate-caddy-deployment.sh` after the old `/usr/local/bin/caddy + /home/tls` layout has already been migrated; it detects no legacy evidence and exits, and routine reconciliation belongs to the normalizer.
 
-### Caddy failure-handling fixes (2026-10-16)
+### Failure handling and rollback boundaries
 
 - Install/update verify the matching custom release before stopping Caddy. A missing
   release aborts; no automatic fallback to an older or stock binary is performed.
@@ -567,14 +628,18 @@ Do not rerun `caddy/migrate-caddy-debian.sh` after the old `/usr/local/bin/caddy
   `www-data`, and preserves the previous active/enabled state. Runtime rollback
   restores the custom binary and service state, **not the APT package version**;
   rerun the updater after resolving the failure to reconcile package/core versions.
-- Legacy migration retains existing service drop-ins for rollback and stops the
-  new process before restoring the old unit/configuration.
-- Identity conversion retains override/permission backups under
-  `/root/www-data-conversion.*`; failed conversion attempts restore them and
-  restart previously active services. Newly created empty directories may remain.
-- Sing-box normalization validates a candidate before changing live configuration/startup.
-  It enables and starts/restarts the normalized service; on failure it restores
-  the prior configuration, local unit, drop-ins, permissions and service state.
+- The one-time migration backs up binaries, units, drop-ins, configurations and a
+  permission manifest under `/root/caddy-migration-backup/<timestamp>`, stops the new
+  process before restoring the old unit/configuration, and keeps APT packages and any
+  created dpkg diversion (reported, not reversed). The legacy storage root is copied,
+  never moved, so it remains the manual rollback source.
+- The shared normalizer validates a running service's configuration before it
+  restarts, restores the drop-ins it applied and replays the permission manifest on
+  failure, and leaves stopped/disabled services untouched. Its retained backup lives
+  under `/run/normalize-caddy-services.*`.
 
-Validation: `bash tests/test_caddy_update.sh`; `bash -n caddy/*.sh` (run each file
-individually). These checks do not replace installation/upgrade testing on Debian.
+Validation: `python3 tests/test_caddy_normalize.py`, `python3 tests/test_caddy_migration.py`,
+`python3 tests/test_caddy_install.py`, `python3 tests/test_sing_box_install.py`,
+`python3 tests/test_init_debian_server.py` and `bash tests/test_caddy_update.sh`; also
+`bash -n caddy/*.sh` (run each file individually). These mocked checks do not replace
+installation/upgrade testing on a Debian host.

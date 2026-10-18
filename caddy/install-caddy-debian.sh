@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Install Caddy Stable package support on Debian 12/13 and select the matching
 # prebuilt custom binary from choicky/caddy-custom-build.
+# The managed runtime state (drop-in, identity, permissions) is established by
+# the shared normalization component, not duplicated here.
 set -Eeuo pipefail
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly NORMALIZE="${SCRIPT_DIR}/normalize-caddy-services.sh"
 readonly CONFIG="/etc/caddy/caddy.jsonc"
-readonly DROPIN_DIR="/etc/systemd/system/caddy.service.d"
-readonly DROPIN_FILE="${DROPIN_DIR}/override.conf"
 readonly CADDY_DEFAULT="/usr/bin/caddy.default"
 readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
 readonly RELEASE_REPO="choicky/caddy-custom-build"
@@ -51,7 +53,7 @@ preflight(){
   case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
-  [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use migrate-caddy-debian.sh."
+  [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use caddy/migrate-caddy-deployment.sh."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture: $(dpkg --print-architecture). Only amd64 and arm64 are provided.";; esac
   case "$(systemctl is-enabled caddy 2>/dev/null || true)" in
     masked|masked-runtime) WAS_MASKED=true;;
@@ -129,30 +131,11 @@ setup_custom_binary(){
 }
 
 setup_service(){
-  install -d -m 0755 "$DROPIN_DIR"
-  cat >"$DROPIN_FILE" <<'EOF'
-[Service]
-User=www-data
-Group=www-data
-Environment=HOME=/var/lib/caddy
-ExecStart=
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/caddy.jsonc --adapter jsonc
-ExecReload=
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/caddy.jsonc --adapter jsonc --force
-EOF
-  systemctl daemon-reload
-}
-
-prepare_paths(){
-  # Caddy and PHP-FPM use the standard Debian web-service identity. sing-box is
-  # configured the same way by install-sing-box-debian.sh, so all three can
-  # access Caddy-managed certificates without ACLs or permission-sync scripts.
-  install -d -o www-data -g www-data -m 0700 /var/lib/caddy
-  chown -R www-data:www-data /var/lib/caddy
-  install -d -o www-data -g www-data -m 0750 /var/log/caddy
-  chown -R www-data:www-data /var/log/caddy
-  chown root:www-data /etc/caddy; chmod 0750 /etc/caddy
-  if [[ -f "$CONFIG" ]]; then chown root:www-data "$CONFIG"; chmod 0640 "$CONFIG"; fi
+  # The shared normalizer owns the managed drop-in and path permissions so
+  # install/update/migrate cannot drift apart from each other.
+  log "Normalizing the managed caddy service state"
+  [[ -f "$NORMALIZE" ]] || die "Missing normalization component: $NORMALIZE"
+  bash "$NORMALIZE" --caddy
 }
 
 validate_installation(){
@@ -165,6 +148,15 @@ validate_installation(){
     log "$CONFIG is absent; no configuration to validate yet."
   fi
   return 0
+}
+
+expose_unit(){
+  # Normalization inspects effective unit properties, which requires the unit
+  # to be unmasked. start_caddy still re-applies the final enable/restart or
+  # stop/disable state afterwards.
+  log "Exposing the unit for normalization"
+  systemctl unmask caddy >/dev/null
+  systemctl daemon-reload
 }
 
 start_caddy(){
@@ -184,5 +176,5 @@ start_caddy(){
   systemctl is-active --quiet caddy || die "Caddy is not active."
 }
 
-main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; setup_service; prepare_paths; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
+main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; expose_unit; setup_service; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
 main "$@"

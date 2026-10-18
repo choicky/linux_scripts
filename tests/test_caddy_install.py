@@ -10,7 +10,7 @@ class CaddyInstallTests(unittest.TestCase):
     def run_case(self,body,expected=0):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
-            src=SOURCE.replace('readonly CONFIG="/etc/caddy/caddy.jsonc"',f'readonly CONFIG="{root}/config.jsonc"').replace('/usr/bin/caddy version','true')
+            src=SOURCE.replace('readonly CONFIG="/etc/caddy/caddy.jsonc"',f'readonly CONFIG="{root}/config.jsonc"').replace('readonly NORMALIZE="${SCRIPT_DIR}/normalize-caddy-services.sh"',f'readonly NORMALIZE="{root}/normalize.sh"').replace('/usr/bin/caddy version','true')
             code=src+f'''
 systemctl() {{ echo "$*" >> '{root}/calls'; return 0; }}
 runuser() {{ return 1; }}
@@ -39,5 +39,20 @@ runuser() {{ return 1; }}
     def test_failed_validation_after_setup_unmasks_only_our_mask(self):
         calls=self.run_case('touch "$CONFIG"; SERVICE_TOUCHED=true; RUNTIME_READY=true; validate_installation',1)
         self.assertIn('stop caddy',calls);self.assertIn('unmask caddy',calls);self.assertNotIn('restart caddy',calls)
+    def test_setup_service_delegates_to_normalizer(self):
+        body='''cat > "$NORMALIZE" <<'STUB'
+#!/bin/bash
+echo "normalize $*" >> 'CALLS_FILE'
+STUB
+chmod +x "$NORMALIZE"
+setup_service'''
+        calls=self.run_case(body.replace('CALLS_FILE','__TEMP__/calls'))
+        self.assertIn('normalize --caddy',calls)
+    def test_setup_service_refuses_without_normalizer(self):
+        calls=self.run_case('setup_service',1)
+        self.assertNotIn('normalize',calls)
+    def test_expose_unit_unmasks_before_normalization(self):
+        calls=self.run_case('expose_unit')
+        self.assertIn('unmask caddy',calls);self.assertIn('daemon-reload',calls)
 
 if __name__=='__main__':unittest.main()
