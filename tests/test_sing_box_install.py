@@ -464,6 +464,11 @@ exec /usr/bin/install "${args[@]}"
             data_file.write_text("persistent state\n")
             os.chmod(data_file, 0o600)
 
+        if getattr(self, "_state_overpermissive", False):
+            loose = fs / "var/lib/sing-box/geoip.db"
+            loose.write_text("geodata\n")
+            os.chmod(loose, 0o666)
+
         if getattr(self, "_wrong_dir_perms", False):
             os.chmod(fs / "etc/sing-box", 0o700)
             os.chmod(fs / "var/lib/sing-box", 0o700)
@@ -587,7 +592,7 @@ exec /usr/bin/install "${args[@]}"
         self.assertEqual(os.stat(etc_sb).st_mode & 0o777, 0o755)
         cfg = fs / "etc/sing-box/config.json"
         if cfg.exists():
-            self.assertEqual(os.stat(cfg).st_mode & 0o777, 0o644)
+            self.assertEqual(os.stat(cfg).st_mode & 0o777, 0o640)
         var_lib = fs / "var/lib/sing-box"
         self.assertEqual(os.stat(var_lib).st_mode & 0o777, 0o755)
 
@@ -724,7 +729,7 @@ exec /usr/bin/install "${args[@]}"
             self._assert_perms_correct(fs)
 
     def test_preserves_executable_files(self):
-        """Executable files stay 0755 while ordinary files become 0644."""
+        """Executables stay 0755; stricter ordinary files are never relaxed."""
         self._has_config = True
         self._has_existing_key = True
         self._has_correct_dropin = True
@@ -737,7 +742,20 @@ exec /usr/bin/install "${args[@]}"
             executable = fs / "var/lib/sing-box/helper.sh"
             data_file = fs / "var/lib/sing-box/state.db"
             self.assertEqual(os.stat(executable).st_mode & 0o777, 0o755)
-            self.assertEqual(os.stat(data_file).st_mode & 0o777, 0o644)
+            self.assertEqual(os.stat(data_file).st_mode & 0o777, 0o600)
+
+    def test_caps_over_permmissive_files(self):
+        """Over-permissive ordinary files are tightened to the 0644 default."""
+        self._has_config = True
+        self._has_existing_key = True
+        self._has_correct_dropin = True
+        self._was_active = True
+        self._state_overpermissive = True
+        with temporary_directory() as tmp:
+            result, base, fs, state, calls = self._run(tmp)
+            self._succeed(result)
+            loose = fs / "var/lib/sing-box/geoip.db"
+            self.assertEqual(os.stat(loose).st_mode & 0o777, 0o644)
 
     def test_fixes_service_user(self):
         """Scenario 6: Different service user."""

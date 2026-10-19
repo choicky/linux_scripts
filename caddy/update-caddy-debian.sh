@@ -2,8 +2,12 @@
 # Upgrade Caddy Stable on the standard linux_scripts layout.
 # The matching prebuilt custom binary is downloaded and verified before APT
 # changes the installed package, so an unavailable custom release is harmless.
+# Even when no upgrade is needed, the shared normalization component still
+# reconciles the managed service state and verifies APT protection.
 set -Eeuo pipefail
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly NORMALIZE="${SCRIPT_DIR}/normalize-caddy-services.sh"
 readonly CONFIG="/etc/caddy/caddy.jsonc"
 readonly CADDY_DEFAULT="/usr/bin/caddy.default"
 readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
@@ -116,6 +120,19 @@ rollback_runtime(){
   exit "$rc"
 }
 
+normalize_state(){
+  # Reconcile the managed drop-in/identity/permissions and re-assert that the
+  # dpkg diversion and the /usr/bin/caddy symlink still select the custom
+  # binary (verified in preflight). dpkg-divert is the protection mechanism:
+  # a plain `apt upgrade` moves the stock binary to $CADDY_DEFAULT behind the
+  # diversion, so the running deployment keeps using the verified custom
+  # binary. No apt-mark hold or pinning is used because each would block the
+  # stock security updates that this script needs as its version source.
+  log "Reconciling managed service state"
+  [[ -f "$NORMALIZE" ]] || die "Missing normalization component: $NORMALIZE"
+  bash "$NORMALIZE" --caddy
+}
+
 upgrade(){
   local target="$1" asset="caddy-linux-${ARCH}"
 
@@ -149,6 +166,11 @@ upgrade(){
   else
     systemctl disable caddy >/dev/null
   fi
+
+  # Reconcile unit state before the restart so a single restart applies both
+  # the new binary and any corrected drop-in without restarting twice.
+  normalize_state
+
   if [[ "$SERVICE_WAS_ACTIVE" == true ]]; then
     systemctl restart caddy
     systemctl is-active --quiet caddy || die "Caddy is not active after upgrade."
@@ -172,6 +194,9 @@ main(){
 
   if [[ "$current" == "$target" && "$(version_of "$CADDY_CUSTOM")" == "$target" ]]; then
     printf '\nCaddy is already up to date.\n'
+    # The no-upgrade path still reconciles managed state; it must not exit
+    # before normalization or the APT protection check above.
+    normalize_state
     exit 0
   fi
 
