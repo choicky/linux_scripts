@@ -21,8 +21,8 @@ one place and cannot drift apart.
 
 - `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary. Delegates runtime reconciliation to the normalizer.
 - `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified. Normalizes service state on every path, including when the package is already current.
-- `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
-- `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, and reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes.
+- `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration, verifies that every effective certificate/key reference is actually readable by `www-data` before any identity change or activation, and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
+- `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes, and on a failed restart rolls the applied changes back and recovers the previously running services.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
@@ -160,15 +160,22 @@ authority for the managed Caddy service state. Its target layout is:
 
 | Path | Owner:Group | Mode |
 |---|---|---|
-| `/etc/caddy/` | `root:www-data` | `0750` |
+| `/etc/caddy/` | `root:www-data` | `0755` |
 | `/etc/caddy/caddy.jsonc` | `root:www-data` | `0640` |
-| `/var/lib/caddy/` (and storage) | `www-data:www-data` | `0700` |
-| `/var/log/caddy/` | `www-data:www-data` | `0750` |
+| `/var/lib/caddy/` | `www-data:www-data` | `0755` |
+| `/var/lib/caddy/.local/share/caddy/` (TLS storage) | `www-data:www-data` | `0700` |
+| `/var/log/caddy/` | `www-data:www-data` | `0755` |
+| `/etc/systemd/system/caddy.service.d/` | `root:root` | `0755` |
 | `/etc/systemd/system/caddy.service.d/override.conf` | `root:root` | `0644` |
 
-Caddy state stays restrictive (`0700`/`0750`/`0640`) because it holds private
-keys, while sing-box uses the installer's `0755`/`0644` layout and reads the
-certificates through the shared `www-data` group. The managed drop-in sets
+Ordinary users can list filenames in the managed configuration, working and
+log directories without sudo, while sensitive *content* stays protected: the
+Caddy TLS storage tree keeps its private `0700`, and the `www-data` group plus
+`0640`/`0600` file modes keep configuration and key material unreadable to
+everyone else. Modes inside a managed tree are capped at these defaults but
+existing stricter modes are never relaxed — a `0600` private key or a `0700`
+storage subdirectory survives every run. sing-box reads its certificates
+directly through the shared `www-data` identity. The managed drop-in sets
 `User`/`Group=www-data`, `Environment=HOME=/var/lib/caddy` and a
 `--config /etc/caddy/caddy.jsonc --adapter jsonc` `ExecStart`/`ExecReload`; the
 vendor/package unit is otherwise left unchanged.
@@ -266,10 +273,8 @@ the sample is not the intended production configuration.
 
 A regular local unit at `/etc/systemd/system/sing-box.service` shadows the
 package unit. The installer refuses to make changes while such a unit exists.
-Its error message still names the deleted helper
-`sing-box/migrate-caddy-cert-paths.sh` (that message is part of the frozen
-sing-box installer and is a documented limitation); the script that actually
-handles this now is `caddy/migrate-caddy-deployment.sh`, which validates,
+Its error message directs the operator to `caddy/migrate-caddy-deployment.sh`,
+the script that actually handles this: it validates,
 backs up and removes the shadowing unit before normalization, so the package
 unit stays authoritative instead of an official installation being reported
 while a local unit remains in control. Likewise, if the existing effective unit
@@ -307,22 +312,27 @@ reported as success.
 | Path | Owner:Group | Mode |
 |---|---|---|
 | `/etc/sing-box/` | `root:www-data` | `0755` |
-| `/etc/sing-box/config.json` | `root:www-data` | `0644` |
+| `/etc/sing-box/config.json` | `root:www-data` | `0640` |
 | `/var/lib/sing-box/` | `www-data:www-data` | `0755` |
 | `/var/log/sing-box/` | `www-data:www-data` | `0755` |
+| systemd drop-in directories | `root:root` | `0755` |
 | systemd drop-in files | `root:root` | `0644` |
 | executable files under managed directories | directory owner | `0755` |
 | `/usr/bin/sing-box` | package-managed | — |
 
 The installer inspects and normalizes these paths on every run, not just
-on fresh installation. Directories are set to `0755`; ordinary non-executable
-files are set to `0644`, while files that are already executable retain
-executable status and are set to `0755`. Persistent data is not deleted and
-file contents are not overwritten. Symlinks at managed paths are rejected.
-Permission metadata is snapshotted before normalization and restored if
-installation fails. The accepted `0644` requirement makes `config.json`
-world-readable; deployments that store proxy credentials or private material
-in it must rely on stricter host access controls or revisit that requirement.
+on fresh installation. Managed top-level directories are set to the exact
+matrix owner and mode (`0755`); ownership inside each tree follows the
+matrix owner, and over-permissive modes are capped — directories to `0755`,
+executable files to `0755`, ordinary files to `0644` — while existing
+stricter modes are never relaxed (`0600` key material and `0700`
+subdirectories survive every run). `config.json` is pinned to exactly
+`0640`, not merely capped, because it can hold proxy credentials.
+Persistent data is not deleted and file contents are not overwritten.
+Symlinks at managed paths are rejected. Permission metadata is snapshotted
+before normalization and restored if installation fails. The shared
+normalizer implements the identical rules, so a second invocation of either
+the installer or the normalizer never reverses the other's permissions.
 
 **Service lifecycle.** The installer does **not** mask the service. A
 pre-existing mask is removed before installation proceeds and is not restored
@@ -381,8 +391,10 @@ service state, file modes and installer exit status. Package-version rollback
 remains a known limitation. The former cross-script normalization gap (the
 deleted sing-box migration helper used its own `0750`/`0640` layout instead of
 the installer's `0755`/`0644`) is closed by the consolidation: sing-box
-reconciliation now runs through the shared normalizer, so there is only one
-layout.
+reconciliation now runs through the shared normalizer, and the installer and
+normalizer implement the identical permission matrix (`config.json` `0640` in
+both), so there is only one layout and repeated invocations converge instead
+of oscillating.
 
 
 ## One-time migration of an old server
@@ -450,12 +462,17 @@ package installation and runtime reconciliation instead of duplicating it:
    place, requires every referenced file to exist and be readable by
    `www-data`, and validates the sing-box candidate as `www-data` before
    applying it;
-8. backs up and removes a shadowing `/etc/systemd/system/sing-box.service` so
+8. re-verifies **every** effective certificate/key reference in the live
+   sing-box configuration with an actual read test as `www-data` — including
+   external paths whose location the migration does not change — and stops
+   before the runtime identity is changed or any service is activated when
+   safe runtime access cannot be established;
+9. backs up and removes a shadowing `/etc/systemd/system/sing-box.service` so
    the package unit wins (`--skip-sing-box` leaves sing-box entirely untouched
    and narrows normalization to `--caddy`);
-9. calls the shared normalizer once (`normalize-caddy-services.sh --both`) to
-   reconcile both services, drop-ins and permissions;
-10. validates the migrated Caddy configuration as `www-data`, then activates
+10. calls the shared normalizer once (`normalize-caddy-services.sh --both`) to
+    reconcile both services, drop-ins and permissions;
+11. validates the migrated Caddy configuration as `www-data`, then activates
     exactly once: a service that was running before is restarted, a
     stopped/disabled service is left stopped/disabled.
 
@@ -477,7 +494,7 @@ For servers that do not yet use the official Stable APT package, run:
 bash sing-box/install-sing-box-debian.sh
 ```
 
-The installer uses the official SagerNet APT repository and installs `sing-box`, never `sing-box-beta`. It retains the vendor systemd unit and uses a unified drop-in to run as `www-data:www-data` with `-c /etc/sing-box/config.json` (single file, not directory mode). It normalizes filesystem permissions (directories 0755, non-executable files 0644, executable files 0755), removes all existing drop-ins, and does not mask the service. See the installation and recovery options above.
+The installer uses the official SagerNet APT repository and installs `sing-box`, never `sing-box-beta`. It retains the vendor systemd unit and uses a unified drop-in to run as `www-data:www-data` with `-c /etc/sing-box/config.json` (single file, not directory mode). It normalizes filesystem permissions to the shared matrix (managed directories `0755`, over-permissive inner modes capped to `0755`/`0755`/`0644` but existing stricter modes never relaxed, `config.json` pinned to `0640`), removes all existing drop-ins, and does not mask the service. See the installation and recovery options above.
 
 If the server already has the correct official Stable package and service, do not reinstall it merely for the certificate-path migration; step 2 handled the references and the shared normalizer reconciles the startup layout.
 
@@ -499,8 +516,12 @@ state and log ownership, validates a running service's configuration as
 definition actually changed. A stopped/disabled service stays
 stopped/disabled; a compliant layout produces no changes at all. Use `--caddy`
 or `--sing-box` to reconcile a single service. On failure it restores the
-drop-ins it applied and replays the permission manifest, retaining the backup
-directory it reports under `/run/normalize-caddy-services.*`.
+drop-ins it applied, replays the permission manifest, and attempts to bring
+back every previously running service whose state was disrupted; the rollback
+is only reported as successful when that service recovery is verified, and
+services that were already stopped or disabled are never started or enabled.
+The backup directory it reports under `/run/normalize-caddy-services.*` is
+retained.
 
 The normalizer deliberately refuses to work while a local
 `/etc/systemd/system/sing-box.service` shadows the package unit (and while a
@@ -634,12 +655,19 @@ Do not rerun `caddy/migrate-caddy-deployment.sh` after the old `/usr/local/bin/c
   created dpkg diversion (reported, not reversed). The legacy storage root is copied,
   never moved, so it remains the manual rollback source.
 - The shared normalizer validates a running service's configuration before it
-  restarts, restores the drop-ins it applied and replays the permission manifest on
-  failure, and leaves stopped/disabled services untouched. Its retained backup lives
-  under `/run/normalize-caddy-services.*`.
+  restarts and, on failure, restores the drop-ins it applied, replays the
+  permission manifest and verifies that every previously running service is
+  active again — reporting an INCOMPLETE rollback (with the retained backup
+  under `/run/normalize-caddy-services.*`) when service recovery fails.
+  Stopped/disabled services are never started or enabled by a rollback.
 
 Validation: `python3 tests/test_caddy_normalize.py`, `python3 tests/test_caddy_migration.py`,
 `python3 tests/test_caddy_install.py`, `python3 tests/test_sing_box_install.py`,
 `python3 tests/test_init_debian_server.py` and `bash tests/test_caddy_update.sh`; also
-`bash -n caddy/*.sh` (run each file individually). These mocked checks do not replace
-installation/upgrade testing on a Debian host.
+`bash -n caddy/*.sh` (run each file individually). The permission matrix is exercised
+against real filesystem modes inside the mocked fixtures (including mode-`000`
+read denial under the mocked runtime identity), but true directory-listing
+behaviour for an ordinary non-`www-data` user and end-to-end identity changes
+must be validated on a disposable Debian/Ubuntu VM with `systemctl` and APT —
+never on a production VPS without explicit authorization. These mocked checks
+do not replace installation/upgrade testing on a Debian host.

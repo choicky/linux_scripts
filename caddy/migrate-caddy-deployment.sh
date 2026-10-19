@@ -21,8 +21,12 @@
 # backed by the same evidence. Storage data is copied (never moved); the
 # legacy root is retained as the rollback source. Certificate references are
 # remapped only for the verified old-root -> standard-root correspondence;
-# explicit external PEM files are left in place and only checked for runtime
-# readability. Ambiguous references are never guessed: migration stops.
+# explicit external PEM files are left in place. Before any runtime-identity
+# change or activation, every effective certificate and key reference is
+# re-verified with an actual read test as www-data — whether or not its path
+# changed — and migration stops before applying further changes when safe
+# runtime access cannot be established. Ambiguous references are never
+# guessed: migration stops.
 #
 # A regular local unit at /etc/systemd/system/sing-box.service shadows the
 # official package unit and would make the normalization component refuse the
@@ -402,13 +406,17 @@ migrate_storage_and_config(){
   local old_root=${OLD_STORAGE_ROOTS[0]} escaped
   log "Copying Caddy storage $old_root -> $STANDARD_STORAGE (source retained)"
 
-  install -d -o www-data -g www-data -m 0700 /var/lib/caddy
+  # Agreed permission matrix: /var/lib/caddy itself is 0755 so ordinary
+  # users can list file names, but the FileStorage tree stays restrictive —
+  # cp -a preserves the legacy modes and the storage root is pinned to 0700;
+  # nothing here recursively loosens sensitive ACME/certificate data.
+  install -d -o www-data -g www-data -m 0755 /var/lib/caddy
   install -d -o www-data -g www-data -m 0700 "$STANDARD_STORAGE"
   # Copy, never move: the legacy root remains the primary rollback source and
   # must not be deleted merely because the new path exists.
   cp -a -- "$old_root/." "$STANDARD_STORAGE/" || die "Failed to copy storage from $old_root."
   chown -R www-data:www-data /var/lib/caddy
-  chmod 0700 /var/lib/caddy
+  chmod 0755 /var/lib/caddy
   chmod 0700 "$STANDARD_STORAGE"
 
   # Rewrite only the JSONC FileStorage root. Domain names differ between
@@ -484,8 +492,36 @@ migrate_singbox_config(){
     || die "sing-box candidate validation failed; the live configuration was not changed."
 
   SINGBOX_CHANGED=true
-  install -o root -g www-data -m 0644 "$candidate" "$SINGBOX_CONFIG"
+  install -o root -g www-data -m 0640 "$candidate" "$SINGBOX_CONFIG"
   log "Applied migrated sing-box configuration (original retained in $BACKUP_DIR)"
+}
+
+verify_singbox_runtime_readability(){
+  # The shared normalizer below switches sing-box to the www-data runtime
+  # identity, and activation restarts the service with these files. Every
+  # effective certificate/key reference must therefore already be readable
+  # as www-data before any of that happens — including external paths
+  # whose location the migration does not change. This is an actual
+  # file-read test under the runtime identity, not a config parse:
+  # 'sing-box check' alone does not prove the process can open the files.
+  [[ $SKIP_SINGBOX == true ]] && return 0
+  [[ -f "$SINGBOX_CONFIG" ]] || return 0
+
+  log "Verifying every effective certificate/key reference is readable as www-data"
+  local -a refs=() ref
+  mapfile -t refs < <(
+    grep -oE '"(certificate_path|key_path)"[[:space:]]*:[[:space:]]*"[^"]+"' "$SINGBOX_CONFIG" \
+      | sed -E 's/.*"([^"]*)"$/\1/' | sort -u
+  )
+  for ref in "${refs[@]}"; do
+    [[ -e "$ref" ]] \
+      || die "Referenced certificate/key does not exist: $ref. Restore the file or remove the reference before migrating; the runtime identity has not been changed."
+    runuser -u www-data -- test -r "$ref" \
+      || die "Referenced certificate/key is not readable by www-data: $ref. Grant the runtime identity access (for example chgrp www-data and chmod g+r on the file, with traversable parent directories, or move the certificate into managed Caddy storage) before migrating; the runtime identity has not been changed."
+  done
+  if (( ${#refs[@]} )); then
+    printf '  all %s certificate/key references readable as www-data\n' "${#refs[@]}"
+  fi
 }
 
 normalize_once(){
@@ -553,6 +589,7 @@ main(){
   run_installer
   migrate_storage_and_config
   migrate_singbox_config
+  verify_singbox_runtime_readability
   relocate_singbox_local_unit
   normalize_once
   validate_and_activate

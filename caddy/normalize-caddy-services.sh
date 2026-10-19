@@ -17,17 +17,32 @@
 # Target state (the installers are the layout authorities; these values match
 # them exactly so installer and normalization never oscillate):
 #   caddy    www-data:www-data; HOME=/var/lib/caddy; managed drop-in with the
-#            jsonc ExecStart/ExecReload for /etc/caddy/caddy.jsonc. Sensitive
-#            state stays restrictive: /var/lib/caddy 0700 www-data,
-#            /etc/caddy 0750 root:www-data, caddy.jsonc 0640 root:www-data,
-#            /var/log/caddy 0750 www-data.
+#            jsonc ExecStart/ExecReload for /etc/caddy/caddy.jsonc.
 #   sing-box www-data:www-data; unified drop-in with StateDirectoryMode=0755
 #            and ExecStart=/usr/bin/sing-box -D /var/lib/sing-box
 #            -c /etc/sing-box/config.json run  (single-file mode; "-c" is
-#            never replaced by "-C"). Ordinary paths use the installer policy:
-#            directories 0755, ordinary files 0644, executables 0755.
-#            /etc/sing-box/config.json is 0644 because the frozen sing-box
-#            installer normalizes that tree that way.
+#            never replaced by "-C").
+#
+# Agreed permission matrix:
+#   /etc/caddy                  root:www-data 0755
+#   /etc/caddy/caddy.jsonc      root:www-data 0640
+#   /etc/sing-box               root:www-data 0755
+#   /etc/sing-box/config.json   root:www-data 0640
+#   /var/lib/caddy              www-data:www-data 0755
+#   /var/lib/sing-box           www-data:www-data 0755
+#   /var/log/caddy              www-data:www-data 0755
+#   /var/log/sing-box           www-data:www-data 0755
+#   systemd drop-in directories root:root 0755, drop-in files root:root 0644
+#   ordinary non-sensitive files 0644, executables 0755
+#
+# The policy is deliberately small and explicit (the installers use the
+# identical rules): managed top-level directories are set to the exact matrix
+# owner and mode, everything inside belongs to the matrix owner, and modes
+# inside a tree are capped at the ordinary defaults but existing stricter
+# modes are never relaxed — 0600 private keys and 0700 Caddy storage
+# subdirectories survive every run. Ordinary users can list file names in the
+# normal config, working and log directories without sudo; content stays
+# protected by file modes and by the stricter sensitive subdirectories.
 #
 # Both services running as www-data means sing-box reads Caddy-managed
 # certificates directly from Caddy storage; this script never copies
@@ -76,12 +91,34 @@ CADDY_UNIT_CHANGED=false
 SINGBOX_UNIT_CHANGED=false
 CADDY_APPLIED=false
 SINGBOX_APPLIED=false
+CADDY_WAS_ACTIVE=false
+SINGBOX_WAS_ACTIVE=false
 WORK_DIR=""
 PERMS_MANIFEST=""
 
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 usage(){ printf 'Usage: %s (--caddy | --sing-box | --both)\n' "$0"; }
+
+restore_service(){
+  # A previously running service whose unit was changed must end up running
+  # the restored unit, not the failed candidate; restarting is the only way
+  # to converge a process that already picked up the candidate. Services
+  # that were stopped or disabled before normalization are never started.
+  local svc=$1 was_active=$2 unit_changed=$3
+  [[ "$was_active" == true ]] || return 0
+  if [[ "$unit_changed" == true ]]; then
+    systemctl restart "$svc" >/dev/null 2>&1 || systemctl start "$svc" >/dev/null 2>&1 || true
+  elif ! systemctl is-active --quiet "$svc"; then
+    systemctl start "$svc" >/dev/null 2>&1 || true
+  fi
+  if systemctl is-active --quiet "$svc"; then
+    printf 'Recovered: %s is active again with the restored configuration.\n' "$svc" >&2
+    return 0
+  fi
+  printf 'WARNING: rollback could not restore the previously running %s service; inspect "systemctl status %s".\n' "$svc" "$svc" >&2
+  return 1
+}
 
 cleanup(){
   local rc=$?
@@ -101,7 +138,11 @@ cleanup(){
     if [[ "$SINGBOX_APPLIED" == true ]]; then
       local dir backup
       for dir in "$SINGBOX_DROPIN_DIR" "$SINGBOX_RUN_DROPIN_DIR"; do
-        backup="$WORK_DIR/backups$(dirname "$dir")"
+        # Match the fixed relative backup layout used when snapshots were taken.
+        case "$dir" in
+          "$SINGBOX_DROPIN_DIR") backup="$WORK_DIR/backups/etc/systemd/system";;
+          *) backup="$WORK_DIR/backups/run/systemd/system";;
+        esac
         [[ -d "$dir" ]] && rm -f -- "$dir"/*.conf
         install -d -m 0755 "$(dirname "$dir")"
         [[ -d "$backup" ]] && cp -a -- "$backup"/. "$dir"/
@@ -119,6 +160,18 @@ cleanup(){
       done <"$PERMS_MANIFEST"
     fi
     systemctl daemon-reload
+    local services_recovered=true
+    if [[ "$CADDY_APPLIED" == true ]]; then
+      restore_service caddy "$CADDY_WAS_ACTIVE" "$CADDY_UNIT_CHANGED" || services_recovered=false
+    fi
+    if [[ "$SINGBOX_APPLIED" == true ]]; then
+      restore_service sing-box "$SINGBOX_WAS_ACTIVE" "$SINGBOX_UNIT_CHANGED" || services_recovered=false
+    fi
+    if [[ "$services_recovered" == true ]]; then
+      printf 'Rollback complete: managed files, permissions and previously running services were restored.\n' >&2
+    else
+      printf 'ERROR: rollback is INCOMPLETE: files were restored but service recovery failed.\n' >&2
+    fi
     printf 'Backup retained: %s\n' "$WORK_DIR" >&2
   fi
   exit "$rc"
@@ -179,6 +232,28 @@ snapshot_perm(){
 
 owner_mode(){ stat -c '%U:%G %a' "$1" 2>/dev/null || printf 'missing\n'; }
 
+cap_tree(){
+  # Apply the agreed permission policy to one managed tree: everything
+  # belongs to $owner, and modes are capped at the ordinary defaults
+  # (directories and executables 0755, ordinary files 0644). Existing modes
+  # that are already at or stricter than the cap are left untouched, so
+  # private keys (0600) and sensitive Caddy storage subdirectories (0700)
+  # are never relaxed. Managed top-level directories are set exactly by the
+  # caller with install -d.
+  local tree=$1 owner=$2 mode path
+  find "$tree" -xdev \( -type d -o -type f \) -exec chown "$owner" {} + \
+    || die "Cannot change ownership under $tree."
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#755 )); then chmod 0755 "$path" || die "Cannot cap $path."; fi
+  done < <(find "$tree" -xdev -type d -printf '%m\0%p\0')
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#755 )); then chmod 0755 "$path" || die "Cannot cap $path."; fi
+  done < <(find "$tree" -xdev -type f -perm /111 -printf '%m\0%p\0')
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#644 )); then chmod 0644 "$path" || die "Cannot cap $path."; fi
+  done < <(find "$tree" -xdev -type f ! -perm /111 -printf '%m\0%p\0')
+}
+
 # ---------------- caddy ----------------
 
 caddy_desired_dropin_current(){
@@ -192,13 +267,13 @@ caddy_desired_dropin_current(){
 }
 
 caddy_paths_current(){
-  [[ "$(owner_mode "$CADDY_STATE")" == "www-data:www-data 700" ]] || return 1
+  [[ "$(owner_mode "$CADDY_STATE")" == "www-data:www-data 755" ]] || return 1
   if [[ -e "$CADDY_LOG" ]]; then
     [[ -d "$CADDY_LOG" && ! -L "$CADDY_LOG" ]] || die "$CADDY_LOG exists but is not a directory."
-    [[ "$(owner_mode "$CADDY_LOG")" == "www-data:www-data 750" ]] || return 1
+    [[ "$(owner_mode "$CADDY_LOG")" == "www-data:www-data 755" ]] || return 1
   fi
   [[ -d "$CADDY_ETC" && ! -L "$CADDY_ETC" ]] || die "$CADDY_ETC must be a real directory."
-  [[ "$(owner_mode "$CADDY_ETC")" == "root:www-data 750" ]] || return 1
+  [[ "$(owner_mode "$CADDY_ETC")" == "root:www-data 755" ]] || return 1
   if [[ -e "$CADDY_CONFIG" ]]; then
     [[ -f "$CADDY_CONFIG" && ! -L "$CADDY_CONFIG" ]] || die "$CADDY_CONFIG exists but is not a regular file."
     [[ "$(owner_mode "$CADDY_CONFIG")" == "root:www-data 640" ]] || return 1
@@ -208,6 +283,9 @@ caddy_paths_current(){
 
 reconcile_caddy(){
   log "Reconciling caddy service state"
+
+  CADDY_WAS_ACTIVE=false
+  if systemctl is-active --quiet caddy; then CADDY_WAS_ACTIVE=true; fi
 
   [[ ! -L "$CADDY_STATE" ]] || die "$CADDY_STATE is a symlink; refusing to follow it."
   [[ ! -L "$CADDY_DROPIN_DIR" ]] || die "$CADDY_DROPIN_DIR is a symlink; refusing to follow it."
@@ -251,21 +329,20 @@ reconcile_caddy(){
   log "Installed managed caddy drop-in: $CADDY_DROPIN"
 
   snapshot_perm "$CADDY_STATE"
-  install -d -o www-data -g www-data -m 0700 "$CADDY_STATE"
-  chown -R www-data:www-data "$CADDY_STATE"
-  chmod 0700 "$CADDY_STATE"
+  install -d -o www-data -g www-data -m 0755 "$CADDY_STATE"
+  cap_tree "$CADDY_STATE" www-data:www-data
 
   if [[ -e "$CADDY_LOG" ]]; then
     snapshot_perm "$CADDY_LOG"
-    install -d -o www-data -g www-data -m 0750 "$CADDY_LOG"
-    chown -R www-data:www-data "$CADDY_LOG"
-    chmod 0750 "$CADDY_LOG"
+    install -d -o www-data -g www-data -m 0755 "$CADDY_LOG"
+    cap_tree "$CADDY_LOG" www-data:www-data
   fi
 
   snapshot_perm "$CADDY_ETC"
-  chown root:www-data "$CADDY_ETC"
-  chmod 0750 "$CADDY_ETC"
+  install -d -o root -g www-data -m 0755 "$CADDY_ETC"
   if [[ -e "$CADDY_CONFIG" ]]; then
+    # The managed config is pinned to exactly 0640 (not merely capped) so a
+    # file left world-readable by an older release converges on the matrix.
     chown root:www-data "$CADDY_CONFIG"
     chmod 0640 "$CADDY_CONFIG"
   fi
@@ -309,9 +386,9 @@ singbox_paths_current(){
   [[ "$(owner_mode "$SINGBOX_ETC")" == "root:www-data 755" ]] || return 1
   if [[ -e "$SINGBOX_CONFIG" ]]; then
     [[ -f "$SINGBOX_CONFIG" && ! -L "$SINGBOX_CONFIG" ]] || die "$SINGBOX_CONFIG exists but is not a regular file."
-    # The frozen installer normalizes this tree to 0644; keep identical values
-    # so installer and normalization never oscillate.
-    [[ "$(owner_mode "$SINGBOX_CONFIG")" == "root:www-data 644" ]] || return 1
+    # config.json is pinned to 0640 by both this script and the sing-box
+    # installer, so neither run ever reverses the other.
+    [[ "$(owner_mode "$SINGBOX_CONFIG")" == "root:www-data 640" ]] || return 1
   fi
   [[ -d "$SINGBOX_STATE" && ! -L "$SINGBOX_STATE" ]] || die "$SINGBOX_STATE must be a real directory."
   [[ "$(owner_mode "$SINGBOX_STATE")" == "www-data:www-data 755" ]] || return 1
@@ -331,6 +408,9 @@ singbox_exec_current(){
 
 reconcile_singbox(){
   log "Reconciling sing-box service state"
+
+  SINGBOX_WAS_ACTIVE=false
+  if systemctl is-active --quiet sing-box; then SINGBOX_WAS_ACTIVE=true; fi
 
   if [[ -e "$SINGBOX_LOCAL_UNIT" || -L "$SINGBOX_LOCAL_UNIT" ]]; then
     # Removing a shadowing local unit is a migration decision (it may carry
@@ -406,9 +486,11 @@ reconcile_singbox(){
   mv -f -- "$tmp" "$SINGBOX_DROPIN"
   log "Installed unified sing-box drop-in: $SINGBOX_DROPIN"
 
-  # Permission policy identical to install-sing-box-debian.sh: ordinary
-  # directories 0755, ordinary files 0644, executables 0755. TLS private keys
-  # live in Caddy storage (/var/lib/caddy, 0700), not in these trees.
+  # Permission policy identical to install-sing-box-debian.sh: managed
+  # top-level directories carry the exact matrix owner/mode (0755), inner
+  # modes are capped but never relaxed, and config.json is pinned to 0640
+  # because it can hold proxy credentials. TLS private keys live in Caddy
+  # storage, whose sensitive subdirectories keep their stricter modes.
   local tree owner user_name group_name
   for tree in "$SINGBOX_ETC" "$SINGBOX_STATE"; do
     owner=root:www-data
@@ -416,18 +498,16 @@ reconcile_singbox(){
     user_name=${owner%%:*}; group_name=${owner##*:}
     snapshot_perm "$tree"
     install -d -o "$user_name" -g "$group_name" -m 0755 "$tree"
-    find "$tree" -xdev -type d -exec chmod 0755 {} +
-    find "$tree" -xdev -type f -perm /111 -exec chmod 0755 {} +
-    find "$tree" -xdev -type f ! -perm /111 -exec chmod 0644 {} +
-    find "$tree" -xdev \( -type d -o -type f \) -exec chown "$owner" {} +
+    cap_tree "$tree" "$owner"
   done
   if [[ -e "$SINGBOX_LOG" ]]; then
     snapshot_perm "$SINGBOX_LOG"
     install -d -o www-data -g www-data -m 0755 "$SINGBOX_LOG"
-    find "$SINGBOX_LOG" -xdev -type d -exec chmod 0755 {} +
-    find "$SINGBOX_LOG" -xdev -type f -perm /111 -exec chmod 0755 {} +
-    find "$SINGBOX_LOG" -xdev -type f ! -perm /111 -exec chmod 0644 {} +
-    find "$SINGBOX_LOG" -xdev \( -type d -o -type f \) -exec chown www-data:www-data {} +
+    cap_tree "$SINGBOX_LOG" www-data:www-data
+  fi
+  if [[ -e "$SINGBOX_CONFIG" ]]; then
+    chown root:www-data "$SINGBOX_CONFIG"
+    chmod 0640 "$SINGBOX_CONFIG"
   fi
 
   systemctl daemon-reload

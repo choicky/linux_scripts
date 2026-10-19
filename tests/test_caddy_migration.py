@@ -4,7 +4,8 @@ The script under test is rewritten on the fly to redirect absolute paths into
 a temporary fake filesystem. The reused installer and the normalization
 component are replaced with logging stubs, so these tests exercise the
 migration orchestration itself (evidence detection, storage copy/retain,
-config rewriting, sing-box reference migration, rollback) without APT,
+config rewriting, sing-box reference migration, certificate readability
+gating, rollback) without APT,
 systemd, packages or service disruption. Ownership changes are simulated by
 no-op chown mocks because unprivileged CI cannot chown to www-data.
 """
@@ -25,7 +26,7 @@ PATH_RE = re.compile(r"(?<![\w.])/(?:etc|usr|var|home|run|root|srv|opt|lib)/")
 class MigrationTests(unittest.TestCase):
     def exercise(self, root="home", sb="mapped", opts=(), fail=None,
                  caddy_active=True, singbox_active=True, pre_standard=False,
-                 sb_local_unit=False, sb_vendor="usr"):
+                 sb_local_unit=False, sb_vendor="usr", external_case=None):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
@@ -118,7 +119,9 @@ class MigrationTests(unittest.TestCase):
             tls_objs = []
             if sb in ("mapped", "residual", "missingcert"):
                 leaf = "nope" if sb == "missingcert" else "example.com"
-                base = self.legacy_root
+                # With an already-migrated storage root the sing-box refs were
+                # migrated with it, so they resolve under standard storage.
+                base = self.standard if root == "missing" else self.legacy_root
                 tls_objs.append(
                     f'"certificate_path": "{base}/certificates/{leaf}/cert.pem", '
                     f'"key_path": "{base}/certificates/{leaf}/key.pem"'
@@ -177,6 +180,14 @@ class MigrationTests(unittest.TestCase):
             storage(self.standard)
         if fail:
             (self.state / fail).touch()
+        if external_case:
+            key = self.fs / "etc/ssl/external.key"
+            if external_case == "chmod":
+                # Mode 000 denies even the owning test user, so the mocked
+                # runuser read test must fail.
+                key.chmod(0o000)
+            elif external_case == "unlink":
+                key.unlink()
 
         # ---------------- stub binaries ----------------
         caddy = self.fs / "usr/bin/caddy"
@@ -290,6 +301,12 @@ exec /usr/bin/install "${args[@]}"
         self.assertTrue(Path(f"{self.standard}/certificates/example.com/cert.pem").exists())
         self.assertTrue(Path(f"{self.standard}/acme/accounts/list.json").exists())
         self.assertTrue(Path(f"{self.F}/home/tls/certificates/example.com/cert.pem").exists())
+        # applied modes follow the permission matrix: state dir traversable
+        # for listing, Caddy storage tree kept private, sing-box config
+        # group-readable but never world-readable
+        self.assertEqual((self.fs / "var/lib/caddy").stat().st_mode & 0o777, 0o755)
+        self.assertEqual(Path(self.standard).stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.sbcfg.stat().st_mode & 0o777, 0o640)
         # caddy config root rewritten
         cfg = self.cfg.read_text()
         self.assertIn(f'"root": "{self.standard}"', cfg)
@@ -419,6 +436,45 @@ exec /usr/bin/install "${args[@]}"
         # sing-box was never applied, its config file untouched above
         self.assertIn("systemctl start caddy", self.calls())
         self.assertNotIn("systemctl restart sing-box", self.calls())
+
+    def test_unreadable_external_key_stops_before_identity_change(self):
+        # §4: with no legacy references to rewrite, only the dedicated
+        # readability gate can stop this run — and it must do so before
+        # normalization changes the runtime identity or activates anything.
+        self.exercise(root="missing", sb="external", external_case="chmod")
+        r = self.result
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not readable by www-data", r.stderr)
+        self.assertIn("the runtime identity has not been changed", r.stderr)
+        self.assertEqual(self.cfg.read_bytes(), self.cfg_bytes)
+        self.assertEqual(self.sbcfg.read_bytes(), self.sbcfg_bytes)
+        self.assertNotIn("normalize", self.calls())
+        self.assertNotIn("systemctl restart sing-box", self.calls())
+
+    def test_unreadable_key_stops_before_mapped_rewrite(self):
+        # With a legacy mapping present the candidate pre-apply check stops
+        # first: nothing is applied when any reference is unreadable.
+        self.exercise(external_case="chmod")
+        r = self.result
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not readable by www-data", r.stderr)
+        self.assertIn("Nothing was applied", r.stderr)
+        self.assertEqual(self.sbcfg.read_bytes(), self.sbcfg_bytes)
+        self.assertEqual(self.cfg.read_bytes(), self.cfg_bytes)
+        self.assertTrue(self.old_binary.exists())
+        self.assertTrue(self.old_unit.exists())
+        self.assertNotIn("normalize", self.calls())
+
+    def test_dangling_reference_stops_before_identity_change(self):
+        # §4 "missing files": an unchanged reference whose file is gone is a
+        # hard stop before the runtime identity is touched.
+        self.exercise(root="missing", sb="external", external_case="unlink")
+        r = self.result
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not exist: ", r.stderr)
+        self.assertIn("the runtime identity has not been changed", r.stderr)
+        self.assertEqual(self.sbcfg.read_bytes(), self.sbcfg_bytes)
+        self.assertNotIn("normalize", self.calls())
 
     def test_singbox_validation_failure_keeps_live_config_unmodified(self):
         self.exercise(fail="singbox_check_fail")

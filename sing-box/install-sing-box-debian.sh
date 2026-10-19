@@ -151,7 +151,7 @@ check_directory_mode_inputs(){
   if (( ${#extras[@]} )); then
     printf 'Existing service uses directory mode with additional inputs:\n' >&2
     printf '  %s\n' "${extras[@]}" >&2
-    die "Refusing to replace -C $config_dir with -c $CONFIG because those inputs would be silently omitted. Move or merge them first; sing-box/migrate-caddy-cert-paths.sh applies the same rule."
+    die "Refusing to replace -C $config_dir with -c $CONFIG because those inputs would be silently omitted. Move or merge them first; caddy/migrate-caddy-deployment.sh applies the same rule."
   fi
 }
 
@@ -176,7 +176,7 @@ check_preconditions(){
     elif [[ ! -f "$LOCAL_UNIT" ]]; then
       die "$LOCAL_UNIT exists but is not a regular file; refusing to continue."
     else
-      die "Local unit $LOCAL_UNIT shadows the package-owned vendor unit. Refusing to make changes while it remains authoritative; inspect it and either migrate it with 'bash sing-box/migrate-caddy-cert-paths.sh' (after the service is on www-data:www-data) or archive it, then rerun."
+      die "Local unit $LOCAL_UNIT shadows the package-owned vendor unit. Refusing to make changes while it remains authoritative; inspect it and either migrate it with 'bash caddy/migrate-caddy-deployment.sh' or archive it, then rerun."
     fi
   fi
   if [[ "$SERVICE_WAS_ACTIVE" == true && ! -f "$CONFIG" ]]; then
@@ -496,40 +496,54 @@ restore_permissions(){
 }
 
 normalize_tree(){
-  local path=$1 owner=$2 dir_mode=$3 file_mode=$4 file_exec_mode=$5
-  [[ -e "$path" ]] || return 0
-  find "$path" -xdev -type d -exec chmod "$dir_mode" {} +
-  # Preserve the existing executable classification while normalizing modes.
-  # The first pass selects files with any execute bit before changing them; the
-  # second pass then cannot match those files.
-  find "$path" -xdev -type f -perm /111 -exec chmod "$file_exec_mode" {} +
-  find "$path" -xdev -type f ! -perm /111 -exec chmod "$file_mode" {} +
-  find "$path" -xdev -type d -exec chown "$owner" {} +
-  find "$path" -xdev -type f -exec chown "$owner" {} +
+  # Agreed permission policy (identical to the shared normalization
+  # component): the tree belongs to $owner, and modes are capped at the
+  # ordinary defaults (directories and executables 0755, ordinary files
+  # 0644). Existing modes at or stricter than the cap are left untouched,
+  # so restrictive secrets (for example a 0600 key dropped in by hand) are
+  # never relaxed and overly permissive files are tightened, applying the
+  # policy to pre-existing files, not only newly created directories.
+  local tree=$1 owner=$2 mode path
+  [[ -e "$tree" ]] || return 0
+  find "$tree" -xdev \( -type d -o -type f \) -exec chown "$owner" {} +
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#755 )); then chmod 0755 "$path"; fi
+  done < <(find "$tree" -xdev -type d -printf '%m\0%p\0')
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#755 )); then chmod 0755 "$path"; fi
+  done < <(find "$tree" -xdev -type f -perm /111 -printf '%m\0%p\0')
+  while IFS= read -r -d '' mode && IFS= read -r -d '' path; do
+    if (( 8#$mode & ~8#644 )); then chmod 0644 "$path"; fi
+  done < <(find "$tree" -xdev -type f ! -perm /111 -printf '%m\0%p\0')
 }
 
 normalize_permissions(){
   log "Normalizing filesystem permissions and ownership"
 
-  # /etc/sing-box/ -- root:www-data, 0755; ordinary files 0644.
+  # /etc/sing-box/ -- root:www-data, 0755.
   install -d -o root -g www-data -m 0755 /etc/sing-box
-  normalize_tree /etc/sing-box root:www-data 0755 0644 0755
+  normalize_tree /etc/sing-box root:www-data
 
-  # /var/lib/sing-box/ -- www-data:www-data, 0755; files 0644 or 0755.
+  # config.json can hold proxy credentials; both the installer and the
+  # shared normalization component pin it to exactly 0640 root:www-data so
+  # neither ever reverses the other.
+  [[ ! -e "$CONFIG" ]] || { chown root:www-data "$CONFIG"; chmod 0640 "$CONFIG"; }
+
+  # /var/lib/sing-box/ -- www-data:www-data, 0755.
   install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
-  normalize_tree /var/lib/sing-box www-data:www-data 0755 0644 0755
+  normalize_tree /var/lib/sing-box www-data:www-data
 
   # /var/log/sing-box/ is normalized only when it already exists.
   if [[ -e /var/log/sing-box ]]; then
     install -d -o www-data -g www-data -m 0755 /var/log/sing-box
-    normalize_tree /var/log/sing-box www-data:www-data 0755 0644 0755
+    normalize_tree /var/log/sing-box www-data:www-data
   fi
 
-  # Systemd drop-in files -- root:root, 0644 or 0755 (directory 0755).
+  # Systemd drop-in files -- root:root, directory 0755, files 0644.
   install -d -o root -g root -m 0755 "$DROPIN_DIR"
-  normalize_tree "$DROPIN_DIR" root:root 0755 0644 0755
+  normalize_tree "$DROPIN_DIR" root:root
   if [[ -d "$RUN_DROPIN_DIR" ]]; then
-    normalize_tree "$RUN_DROPIN_DIR" root:root 0755 0644 0755
+    normalize_tree "$RUN_DROPIN_DIR" root:root
   fi
 
   # APT signing key and repository definition -- root:root, 0644.

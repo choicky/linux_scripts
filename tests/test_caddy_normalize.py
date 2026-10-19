@@ -68,9 +68,9 @@ class NormalizeTests(unittest.TestCase):
         self.singbox_state = self.fs / "var/lib/sing-box"
         for d, mode in [
             (self.caddy_dropin_dir, 0o755), (self.singbox_dropin_dir, 0o755),
-            (self.singbox_run_dir, 0o755), (self.caddy_etc, 0o750),
-            (self.singbox_etc, 0o755), (self.caddy_state, 0o700),
-            (self.caddy_log, 0o750), (self.singbox_state, 0o755),
+            (self.singbox_run_dir, 0o755), (self.caddy_etc, 0o755),
+            (self.singbox_etc, 0o755), (self.caddy_state, 0o755),
+            (self.caddy_log, 0o755), (self.singbox_state, 0o755),
             (self.fs / "usr/lib/systemd/system", 0o755),
             (self.fs / "run", 0o755),
         ]:
@@ -82,7 +82,7 @@ class NormalizeTests(unittest.TestCase):
         os.chmod(self.caddy_cfg, 0o640)
         self.singbox_cfg = self.singbox_etc / "config.json"
         self.singbox_cfg.write_text('{"log":{"level":"info"},"inbounds":[]}\n')
-        os.chmod(self.singbox_cfg, 0o644)
+        os.chmod(self.singbox_cfg, 0o640)
 
         owners = {
             self.caddy_dropin_dir: "root:root",
@@ -379,6 +379,9 @@ case "$1" in
   stop) rm -f "$STATE/$svc.active" ;;
   start|restart)
     if [ -f "$STATE/$svc.start_fail" ]; then rm -f "$STATE/$svc.active"; exit 1; fi
+    if [ "$1" = restart ] && [ -f "$STATE/$svc.restart_fail_once" ]; then
+      rm -f "$STATE/$svc.restart_fail_once"; rm -f "$STATE/$svc.active"; exit 1
+    fi
     touch "$STATE/$svc.active"
     ;;
   enable) touch "$STATE/$svc.enabled" ;;
@@ -512,13 +515,19 @@ esac
         self.assertNotIn("systemctl start caddy", calls)
         self.assertIn("stopped/disabled state preserved", r.stdout)
 
-    def test_caddy_permission_drift_applies_restrictive_modes(self):
-        os.chmod(self.caddy_state, 0o755)
+    def test_caddy_permission_drift_applies_matrix_modes(self):
+        # A deployment left over from the previous restrictive policy must
+        # converge on the agreed matrix, not oscillate back.
+        os.chmod(self.caddy_state, 0o700)
+        os.chmod(self.caddy_log, 0o750)
+        os.chmod(self.caddy_etc, 0o750)
         os.chmod(self.caddy_cfg, 0o644)
         self.state.joinpath("caddy.active").unlink()
         r = self._run(["--caddy"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self.caddy_state.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.caddy_state.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.caddy_log.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.caddy_etc.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.caddy_cfg.stat().st_mode & 0o777, 0o640)
         self.assertNotIn("systemctl restart caddy", self._calls())
 
@@ -557,7 +566,9 @@ esac
         os.chmod(resolved, 0o644)
         os.chmod(self.singbox_state, 0o750)
         os.chmod(self.singbox_etc, 0o750)
-        os.chmod(self.singbox_cfg, 0o640)
+        # Legacy installer policy normalized config.json to 0644; the agreed
+        # matrix pins it to 0640, so convergence must upgrade the mode.
+        os.chmod(self.singbox_cfg, 0o644)
 
     def test_singbox_legacy_layout_converges_to_installer_convention(self):
         self._legacy_singbox_layout()
@@ -571,7 +582,7 @@ esac
         self.assertFalse((self.singbox_run_dir / "20-resolved.conf").exists())
         self.assertEqual(self.singbox_state.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.singbox_etc.stat().st_mode & 0o777, 0o755)
-        self.assertEqual(self.singbox_cfg.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.singbox_cfg.stat().st_mode & 0o777, 0o640)
         self.assertIn("systemctl restart sing-box", self._calls())
 
     def test_singbox_reconciled_run_is_idempotent(self):
@@ -682,11 +693,139 @@ esac
 
     def test_singbox_only_mode_leaves_caddy_untouched(self):
         (self.caddy_dropin_dir / "override.conf").unlink()
-        os.chmod(self.caddy_state, 0o755)
+        os.chmod(self.caddy_state, 0o700)
         r = self._run(["--sing-box"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse((self.caddy_dropin_dir / "override.conf").exists())
+        self.assertEqual(self.caddy_state.stat().st_mode & 0o777, 0o700)
         self.assertNotIn("systemctl restart caddy", self._calls())
+
+    # ---------------- permission policy: cap, never relax ----------------
+
+    def test_permission_policy_preserves_stricter_modes(self):
+        # Force an apply on both services and plant files whose modes are
+        # stricter than the policy: they must survive untouched, while an
+        # overly permissive file is capped at the ordinary default.
+        secret_dir = self.caddy_state / ".local/share/caddy/certificates/example.com"
+        secret_dir.mkdir(parents=True)
+        os.chmod(self.caddy_state / ".local", 0o700)
+        os.chmod(secret_dir, 0o700)
+        key = secret_dir / "key.pem"
+        key.write_text("PRIVATE")
+        os.chmod(key, 0o600)
+        loose = self.singbox_etc / "creds"
+        loose.write_text("x")
+        os.chmod(loose, 0o666)
+        (self.caddy_dropin_dir / "override.conf").unlink()
+        self._legacy_singbox_layout()
+        r = self._run(["--both"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600,
+                         "0600 secrets must never be downgraded or widened")
+        self.assertEqual(secret_dir.stat().st_mode & 0o777, 0o700,
+                         "sensitive storage subdirectories must stay 0700")
+        self.assertEqual(loose.stat().st_mode & 0o777, 0o644,
+                         "overly permissive ordinary files are capped at 0644")
+        # Managed top-level directories carry the exact matrix mode.
+        self.assertEqual(self.caddy_state.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.singbox_etc.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.singbox_cfg.stat().st_mode & 0o777, 0o640)
+
+    def test_normalizer_rerun_does_not_reverse_installer_matrix(self):
+        # After convergence a second run must be a pure no-op (the matrix is
+        # a fixed point shared with the installers).
+        os.chmod(self.singbox_cfg, 0o644)
+        first = self._run(["--both"])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self._run(["--both"])
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("caddy: compliant (no changes)", second.stdout)
+        self.assertIn("sing-box: compliant (no changes)", second.stdout)
+
+    # ---------------- restart-failure rollback ----------------
+
+    def test_caddy_restart_failure_restores_unit_and_recovers_service(self):
+        legacy = "[Service]\nUser=root\nGroup=root\n"
+        old = self.caddy_dropin_dir / "override.conf"
+        old.write_text(legacy)
+        os.chmod(old, 0o600)
+        self.state.joinpath("caddy.restart_fail_once").touch()
+        r = self._run(["--caddy"])
+        self.assertEqual(r.returncode, 1)
+        # candidate drop-in rolled back, permissions replayed, and the
+        # previously running service was recovered afterwards
+        self.assertEqual(old.read_text(), legacy)
+        self.assertEqual(old.stat().st_mode & 0o777, 0o600)
+        self.assertTrue((self.state / "caddy.active").exists())
+        self.assertIn("Recovered: caddy is active again", r.stderr)
+        self.assertIn("Rollback complete", r.stderr)
+        # the recovery restart happened exactly once after the failure
+        calls = self._calls()
+        self.assertEqual(calls.count("systemctl restart caddy"), 2)
+
+    def test_singbox_restart_failure_restores_dropins_and_recovers(self):
+        self._legacy_singbox_layout()
+        before = (self.singbox_dropin_dir / "override.conf").read_text()
+        self.state.joinpath("sing-box.restart_fail_once").touch()
+        r = self._run(["--sing-box"])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((self.singbox_dropin_dir / "override.conf").read_text(), before)
+        self.assertTrue((self.singbox_dropin_dir / "zzzz-single-file.conf").exists())
+        self.assertTrue((self.singbox_run_dir / "20-resolved.conf").exists())
+        self.assertTrue((self.state / "sing-box.active").exists())
+        self.assertIn("Recovered: sing-box is active again", r.stderr)
+
+    def test_both_partial_failure_recovers_both_running_services(self):
+        (self.caddy_dropin_dir / "override.conf").unlink()
+        self._legacy_singbox_layout()
+        self.state.joinpath("sing-box.restart_fail_once").touch()
+        r = self._run(["--both"])
+        self.assertEqual(r.returncode, 1)
+        # caddy had succeeded and sing-box failed: the whole run is rolled
+        # back, and both previously running services end active again.
+        self.assertFalse((self.caddy_dropin_dir / "override.conf").exists())
+        self.assertTrue((self.singbox_dropin_dir / "zzzz-single-file.conf").exists())
+        self.assertTrue((self.state / "caddy.active").exists())
+        self.assertTrue((self.state / "sing-box.active").exists())
+        self.assertIn("Recovered: sing-box", r.stderr)
+        # caddy was reconciled and restarted once; rollback restarts it a
+        # second time only because the process is running the candidate
+        # unit and must converge onto the restored one.
+        self.assertEqual(self._calls().count("systemctl restart caddy"), 2)
+
+    def test_failed_rollback_restart_is_reported_not_hidden(self):
+        old = self.caddy_dropin_dir / "override.conf"
+        old.write_text("[Service]\nUser=root\n")
+        self.state.joinpath("caddy.start_fail").touch()
+        r = self._run(["--caddy"])
+        self.assertEqual(r.returncode, 1)
+        # files were restored but the service could not be recovered
+        self.assertIn("rollback could not restore the previously running caddy service", r.stderr)
+        self.assertIn("INCOMPLETE", r.stderr)
+        self.assertNotIn("Rollback complete", r.stderr)
+
+    def test_previously_stopped_service_is_not_started_on_rollback(self):
+        (self.state / "caddy.active").unlink()
+        (self.caddy_dropin_dir / "override.conf").unlink()
+        self._legacy_singbox_layout()
+        self.state.joinpath("sing-box.restart_fail_once").touch()
+        r = self._run(["--both"])
+        self.assertEqual(r.returncode, 1)
+        calls = self._calls()
+        self.assertNotIn("systemctl start caddy", calls)
+        self.assertNotIn("systemctl restart caddy", calls)
+        self.assertFalse((self.state / "caddy.active").exists())
+
+    def test_previously_disabled_service_stays_disabled(self):
+        (self.state / "caddy.enabled").unlink()
+        (self.caddy_dropin_dir / "override.conf").unlink()
+        self.state.joinpath("caddy.start_fail").touch()
+        r = self._run(["--caddy"])
+        self.assertEqual(r.returncode, 1)
+        calls = self._calls()
+        self.assertNotIn("systemctl enable caddy", calls)
+        self.assertNotIn("systemctl disable caddy", calls)
+        self.assertFalse((self.state / "caddy.enabled").exists())
 
     def test_missing_caddy_binary_refuses_caddy_mode(self):
         (self.fs / "usr/bin/caddy").unlink()
