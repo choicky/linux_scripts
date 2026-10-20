@@ -2,8 +2,8 @@
 from pathlib import Path
 import subprocess,tempfile,unittest
 
-SCRIPT=Path(__file__).resolve().parents[1]/'caddy/install-caddy-debian.sh'
-if not SCRIPT.exists():SCRIPT=Path(__file__).with_name('install-caddy-debian.sh')
+SCRIPT=Path(__file__).resolve().parents[1]/'caddy/install-caddy-apt.sh'
+if not SCRIPT.exists():SCRIPT=Path(__file__).with_name('install-caddy-apt.sh')
 SOURCE=SCRIPT.read_text().rsplit('main "$@"',1)[0]
 
 class CaddyInstallTests(unittest.TestCase):

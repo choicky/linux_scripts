@@ -26,7 +26,8 @@ PATH_RE = re.compile(r"(?<![\w.])/(?:etc|usr|var|home|run|root|srv|opt|lib)/")
 class MigrationTests(unittest.TestCase):
     def exercise(self, root="home", sb="mapped", opts=(), fail=None,
                  caddy_active=True, singbox_active=True, pre_standard=False,
-                 sb_local_unit=False, sb_vendor="usr", external_case=None):
+                 sb_local_unit=False, sb_vendor="usr", external_case=None,
+                 installer_probe="accept"):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
@@ -250,8 +251,24 @@ exec /usr/bin/install "${args[@]}"
 """)
 
         # ---------------- collaborator stubs ----------------
-        (self.base / "install-caddy-debian.sh").write_text(
-            f"#!/bin/bash\nprintf 'installer %s\\n' \"$*\" >> '{self.calls_path}'\nexit 0\n"
+        # --check-os is a read-only distribution probe, so an accepted probe is
+        # logged as "probe --check-os" rather than as an installer invocation;
+        # tests treat only "installer ..." as a mutation. A refused probe logs
+        # nothing at all, because nothing has been inspected or changed yet.
+        if installer_probe == "accept":
+            probe = (
+                f"if [ \"$1\" = '--check-os' ]; then printf 'probe --check-os\\n'"
+                f" >> '{self.calls_path}'; echo 'Debian 12'; exit 0; fi\n"
+            )
+        else:
+            probe = (
+                "if [ \"$1\" = '--check-os' ]; then "
+                "printf '%s' \"ERROR: Distribution 'fedora' is not supported.\" >&2; exit 1; fi\n"
+            )
+        (self.base / "install-caddy-apt.sh").write_text(
+            f"#!/bin/bash\n{probe}"
+            f"printf 'installer %s\\n' \"$*\" >> '{self.calls_path}'\n"
+            f"exit 0\n"
         )
         (self.base / "normalize-caddy-services.sh").write_text(
             f"#!/bin/bash\nprintf 'normalize %s\\n' \"$*\" >> '{self.calls_path}'\nexit 0\n"
@@ -286,6 +303,17 @@ exec /usr/bin/install "${args[@]}"
 
     def calls(self):
         return self.calls_path.read_text()
+
+    def mutations(self):
+        """Collaborator calls that change the system.
+
+        The read-only "--check-os" distribution probe is logged as
+        "probe --check-os" and is excluded: it installs, stops, rewrites or
+        removes nothing, so it must not count as a mutation in the no-op tests.
+        """
+        return "".join(
+            f"{line}\n" for line in self.calls().splitlines() if not line.startswith("probe ")
+        )
 
     def tearDown(self):
         # allow repeated exercise() calls in one test method
@@ -374,8 +402,35 @@ exec /usr/bin/install "${args[@]}"
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("already appears standard", r.stdout)
         self.assertIn("normalize-caddy-services.sh", r.stdout)
+        self.assertEqual(self.mutations().strip(), "")
+        self.assertIsNone(self.backup)
+
+    # ---------------- distribution support gate ----------------
+
+    def test_distribution_is_probed_before_any_service_or_file_change(self):
+        self.exercise()
+        self.assertEqual(self.result.returncode, 0, self.result.stdout + self.result.stderr)
+        lines = self.calls().splitlines()
+        self.assertEqual(lines[0], "probe --check-os")
+        self.assertIn("Supported distribution: Debian 12", self.result.stdout)
+        for mutating in ("systemctl stop caddy", "installer --no-start"):
+            self.assertIn(mutating, lines)
+            self.assertLess(lines.index("probe --check-os"), lines.index(mutating))
+
+    def test_unsupported_distribution_stops_before_any_change(self):
+        # The installer owns the supported matrix; when it refuses the host the
+        # migration must not have stopped, backed up or rewritten anything.
+        self.exercise(installer_probe="refuse")
+        r = self.result
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("not supported by the Caddy APT installer", r.stderr)
+        self.assertIn("nothing was changed", r.stderr)
         self.assertEqual(self.calls().strip(), "")
         self.assertIsNone(self.backup)
+        self.assertTrue(self.old_binary.exists())
+        self.assertTrue(self.old_unit.exists())
+        self.assertEqual(self.cfg.read_bytes(), self.cfg_bytes)
+        self.assertEqual(self.sbcfg.read_bytes(), self.sbcfg_bytes)
 
     def test_partial_storage_evidence_stops_before_any_change(self):
         self.exercise(root="partial")
@@ -533,13 +588,13 @@ exec /usr/bin/install "${args[@]}"
     def test_rerun_after_success_is_noop(self):
         self.exercise()
         self.assertEqual(self.result.returncode, 0, self.result.stdout + self.result.stderr)
-        calls_before = self.calls()
+        calls_before = self.mutations()
         # second execution against the already-migrated state: no legacy
         # evidence remains, so the script must stop without touching anything
         self._run_script()
         self.assertEqual(self.result.returncode, 0, self.result.stdout + self.result.stderr)
         self.assertIn("already appears standard", self.result.stdout)
-        self.assertEqual(self.calls(), calls_before)
+        self.assertEqual(self.mutations(), calls_before)
 
     # ---------------- shadowing local sing-box unit (absorbed helper duty) ----------------
 

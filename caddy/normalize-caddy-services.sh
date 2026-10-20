@@ -205,7 +205,7 @@ preflight(){
     command -v "$command" >/dev/null 2>&1 || die "Missing required command: $command"
   done
   if [[ "$DO_CADDY" == true ]]; then
-    [[ -x /usr/bin/caddy ]] || die "/usr/bin/caddy is missing; run caddy/install-caddy-debian.sh first."
+    [[ -x /usr/bin/caddy ]] || die "/usr/bin/caddy is missing; run caddy/install-caddy-apt.sh first."
   fi
   if [[ "$DO_SINGBOX" == true ]]; then
     if ! dpkg-query -W -f='${Status}\n' sing-box 2>/dev/null | grep -Fxq 'install ok installed'; then
@@ -318,7 +318,7 @@ reconcile_caddy(){
   [[ -f "$CADDY_DROPIN" ]] && cp -a -- "$CADDY_DROPIN" "$WORK_DIR/backups/caddy"/
 
   # Only the managed override.conf is rewritten; unrelated caddy drop-ins are
-  # preserved, matching install-caddy-debian.sh.
+  # preserved, matching install-caddy-apt.sh.
   local tmp
   tmp=$(mktemp "$CADDY_DROPIN_DIR/.override.conf.XXXXXX")
   printf '%s\n' "$CADDY_DROPIN_CONTENT" >"$tmp"

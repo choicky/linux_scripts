@@ -19,8 +19,8 @@ update and migration all delegate service/runtime reconciliation to the same
 normalizer, so managed systemd drop-ins and permissions are authored in exactly
 one place and cannot drift apart.
 
-- `caddy/install-caddy-debian.sh` — install official Caddy Stable from APT, then use the matching prebuilt custom Caddy binary. Delegates runtime reconciliation to the normalizer.
-- `caddy/update-caddy-debian.sh` — safely upgrade Caddy only when the matching prebuilt custom binary is already available and verified. Normalizes service state on every path, including when the package is already current.
+- `caddy/install-caddy-apt.sh` — install official Caddy Stable from APT on Debian 12/13 or Ubuntu 24.04/26.04 LTS, then use the matching prebuilt custom Caddy binary. Delegates runtime reconciliation to the normalizer. `caddy/install-caddy-debian.sh` remains as a thin compatibility entry point that forwards every argument to it; there is no second implementation.
+- `caddy/update-caddy-debian.sh` — safely upgrade Caddy on the same Debian/Ubuntu matrix, only when the matching prebuilt custom binary is already available and verified. Normalizes service state on every path, including when the package is already current.
 - `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration, verifies that every effective certificate/key reference is actually readable by `www-data` before any identity change or activation, and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
 - `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes, and on a failed restart rolls the applied changes back and recovers the previously running services.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
@@ -28,6 +28,54 @@ one place and cannot drift apart.
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
 - `system/set-hostname.sh` — safely change a Debian 12/13 VPS hostname and matching hosts aliases.
+
+## Supported distributions for the Caddy workflow
+
+The Caddy install, update and migration scripts accept exactly these
+distributions, read from the `ID` and `VERSION_ID` fields of `/etc/os-release`:
+
+| Distribution | Versions |
+|---|---|
+| Debian | 12, 13 |
+| Ubuntu | 24.04 LTS, 26.04 LTS |
+
+Anything else is rejected before a package, binary, unit or permission is
+touched — including apt-based derivatives such as Linux Mint or Pop!_OS, because
+`apt-get` existing is not the same as a supported host. A missing, empty or
+unparsable `/etc/os-release`, or one without an `ID`, is also rejected rather
+than guessed at.
+
+The APT workflow is otherwise shared: both distributions install the same
+official Caddy Stable `.deb` from the Caddy Cloudsmith repository (which is
+published for codename `any-version`), use the same `dpkg-divert` layout, the
+same `www-data:www-data` service identity, and the same custom
+`caddy-linux-amd64`/`caddy-linux-arm64` release assets. Ubuntu is not a special
+case in the install path.
+
+Two Ubuntu-only conditions are handled explicitly:
+
+- Ubuntu publishes its own `caddy` build in the `universe` pocket (Debian does
+  not). If the official Caddy source ever fails to load, APT would silently
+  resolve to that distribution build, so the installer and updater assert that
+  the candidate version really comes from
+  `https://dl.cloudsmith.io/public/caddy/stable/` before stopping anything.
+  The origin is taken from the candidate's own version-table entry: a
+  repository line belongs to the version printed directly above it, while the
+  `Installed` and `Candidate` header lines repeat versions with no origin at
+  all, so a version match anywhere in the output would attribute the first
+  listed repository to the wrong version. A candidate with no origin line is
+  refused rather than guessed.
+- The dependency set is limited to `ca-certificates curl gpg`, which live in
+  `main` on both distributions. The former `debian-keyring`,
+  `debian-archive-keyring` and `apt-transport-https` packages are not consulted
+  for a `signed-by` third-party keyring, modern apt speaks HTTPS natively, and
+  all three sit in Ubuntu's `universe`, where a disabled pocket would abort the
+  run.
+
+`bash caddy/install-caddy-apt.sh --check-os` prints the detected distribution
+(or rejects the host) without root privileges and without changing anything; the
+migration script uses it as its first check so an unsupported host can never be
+left mid-migration.
 
 
 ## System tools
@@ -183,13 +231,14 @@ vendor/package unit is otherwise left unchanged.
 
 ## Clean installation
 
-For a new Debian 12/13 or Ubuntu server that does not have the old manual Caddy layout:
+For a new Debian 12/13 or Ubuntu 24.04/26.04 LTS server that does not have the
+old manual Caddy layout:
 
 ```bash
 git clone https://github.com/choicky/linux_scripts.git /root/linux_scripts
 cd /root/linux_scripts
 
-bash caddy/install-caddy-debian.sh
+bash caddy/install-caddy-apt.sh
 bash sing-box/install-sing-box-debian.sh
 ```
 
@@ -452,7 +501,7 @@ package installation and runtime reconciliation instead of duplicating it:
    permission manifest under `/root/caddy-migration-backup/<timestamp>`;
 4. stops and removes the legacy Caddy paths so the package unit becomes
    authoritative; the legacy storage root is retained in place, never moved;
-5. reruns `caddy/install-caddy-debian.sh --no-start` for the official APT
+5. reruns `caddy/install-caddy-apt.sh --no-start` for the official APT
    package, the matching custom binary, dpkg-divert registration and the
    managed drop-ins;
 6. copies the legacy storage into `/var/lib/caddy/.local/share/caddy` and
@@ -609,7 +658,8 @@ selected. The updater intentionally uses **no** `apt-mark hold` and **no** APT
 pinning: either would block the stock security updates whose candidate version is
 the updater's source of truth for which custom release to fetch.
 
-Do not use `install-caddy-debian.sh` as the normal upgrade command once the standard layout is installed.
+Do not use `install-caddy-apt.sh` (or its `install-caddy-debian.sh` compatibility
+name) as the normal upgrade command once the standard layout is installed.
 
 ## Backups and old TLS storage
 
@@ -663,7 +713,8 @@ Do not rerun `caddy/migrate-caddy-deployment.sh` after the old `/usr/local/bin/c
   Stopped/disabled services are never started or enabled by a rollback.
 
 Validation: `python3 tests/test_caddy_normalize.py`, `python3 tests/test_caddy_migration.py`,
-`python3 tests/test_caddy_install.py`, `python3 tests/test_sing_box_install.py`,
+`python3 tests/test_caddy_install.py`, `python3 tests/test_caddy_os_support.py`,
+`python3 tests/test_sing_box_install.py`,
 `python3 tests/test_init_debian_server.py` and `bash tests/test_caddy_update.sh`; also
 `bash -n caddy/*.sh` (run each file individually). The permission matrix is exercised
 against real filesystem modes inside the mocked fixtures (including mode-`000`
@@ -671,4 +722,29 @@ read denial under the mocked runtime identity), but true directory-listing
 behaviour for an ordinary non-`www-data` user and end-to-end identity changes
 must be validated on a disposable Debian/Ubuntu VM with `systemctl` and APT —
 never on a production VPS without explicit authorization. These mocked checks
-do not replace installation/upgrade testing on a Debian host.
+do not replace installation/upgrade testing on a Debian or Ubuntu host.
+
+`tests/test_caddy_os_support.py` covers the distribution matrix: the four
+supported combinations, unsupported Debian/Ubuntu versions, apt-based
+derivatives, and missing/empty/`ID`-less `/etc/os-release`, for the installer
+and the updater alike. It also asserts that the two scripts share one
+distribution policy and one repository-origin policy, that the compatibility
+entry point forwards instead of reimplementing, and that the APT candidate is
+rejected unless its own version-table entry is published by the official Caddy
+repository. The origin fixtures run through both entry points and cover a
+`universe`-only candidate, an older Cloudsmith version listed before a
+`universe` candidate (which must still be rejected), a Cloudsmith candidate
+listed after a `universe` version, the `***` and `::` installed markers, the
+`/var/lib/dpkg/status` entry, a candidate with no origin line, a malformed
+version entry, an empty table, and APT warning text around the table. On a real
+Linux host it additionally runs the read-only `--check-os` probe against the
+actual `/etc/os-release`; that self-skips where no such file exists.
+
+**Follow-up validation.** Owner: repository maintainer. Trigger: before the
+first Ubuntu Caddy deployment. Acceptance criteria: run
+`bash caddy/install-caddy-apt.sh --no-start` on a disposable Ubuntu 24.04 and
+26.04 instance, then confirm the Cloudsmith source was preferred over the
+`universe` build, `systemctl show caddy -p User -p Group -p ExecStart` reports
+the managed `www-data` layout, `/usr/bin/caddy` resolves to `caddy.custom`, and
+a second run is a normalizing no-op. Mocked tests prove control flow and
+refusals; they do not prove APT resolution or live systemd behaviour on Ubuntu.
