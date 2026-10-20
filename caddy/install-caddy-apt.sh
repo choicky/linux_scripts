@@ -78,16 +78,33 @@ caddy_repo_candidate(){
   # the official Caddy repository. Ubuntu also ships its own distro build of
   # caddy (Debian does not), so a version alone cannot prove that the
   # caddy-stable source actually loaded.
-  local policy raw origin
+  #
+  # A repository line belongs to the version entry printed directly above it
+  # and to no other version: the Installed and Candidate header lines repeat
+  # those versions without any origin, so matching a version number anywhere in
+  # the output would attribute the first repository line to the wrong version.
+  local policy raw origins origin first approved
   policy="$(LC_ALL=C apt-cache policy caddy)"
   raw="$(sed -n 's/^ *Candidate: \([^ ]*\).*/\1/p' <<<"$policy")"
   [[ -n "$raw" && "$raw" != '(none)' ]] || die "No Caddy APT candidate available."
-  origin="$(awk -v want="$raw" '
-    { for (i = 1; i <= NF; i++) if ($i == want) { seen = 1; break } }
-    seen && $1 ~ /^[0-9]+$/ && $2 ~ /^https?:/ { print $2; exit }
+  origins="$(awk -v want="$raw" '
+    /^[[:space:]]*Version table:/ { table = 1; next }
+    /^[^[:space:]]/ { table = 0; cur = ""; next }
+    !table { next }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[a-z][a-z0-9+.-]*:/ { if (cur == want) print $2; next }
+    $NF ~ /^[0-9]+$/ { cur = ($1 == "***" || $1 == "::") ? $2 : $1 }
   ' <<<"$policy")"
-  [[ "$origin" == "$CADDY_REPO_PREFIX"* ]] \
-    || die "The Caddy APT candidate $raw comes from '${origin:-unknown origin}', not the official Caddy repository at ${CADDY_REPO_PREFIX}. The caddy-stable source probably failed to load (network or signing-key problem) and this is a distribution build; fix the repository before continuing."
+  [[ -n "$origins" ]] \
+    || die "The Caddy APT candidate $raw has no repository origin in the apt-cache policy version table; refusing to guess where it comes from."
+  approved=false
+  first=''
+  while IFS= read -r origin; do
+    [[ -n "$origin" ]] || continue
+    [[ -n "$first" ]] || first="$origin"
+    case "$origin" in "$CADDY_REPO_PREFIX"*) approved=true;; esac
+  done <<<"$origins"
+  [[ "$approved" == true ]] \
+    || die "The Caddy APT candidate $raw comes from '${first}', not the official Caddy repository at ${CADDY_REPO_PREFIX}. The caddy-stable source probably failed to load (network or signing-key problem) and this is a distribution build; fix the repository before continuing."
   printf '%s\n' "$raw"
 }
 

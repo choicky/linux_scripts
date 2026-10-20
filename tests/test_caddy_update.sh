@@ -30,6 +30,51 @@ set -e
   || { echo "FAIL: unclear origin rejection message: $result"; exit 1; }
 echo 'PASS: distribution-owned caddy candidate is rejected'
 
+# The origin must bind to the candidate's own version entry. Ubuntu lists a
+# distribution build in the same table as the official repository, so a parser
+# that keeps its first match attributes the official origin to the wrong
+# version and lets a downgrade through.
+apt-cache(){
+  printf 'caddy:\n  Installed: 2.11.7\n  Candidate: 2.6.2-14ubuntu1\n  Version table:\n     2.11.7 500\n        500 https://dl.cloudsmith.io/public/caddy/stable/deb/deb stable/main amd64 Packages\n *** 2.6.2-14ubuntu1 500\n        500 http://archive.ubuntu.com/ubuntu resolute/universe amd64 Packages\n    100 /var/lib/dpkg/status\n'
+}
+set +e
+result=$( (caddy_repo_candidate) 2>&1 )
+rc=$?
+set -e
+[[ "$rc" != 0 ]] || { echo "FAIL: universe candidate accepted via an older cloudsmith entry: $result"; exit 1; }
+[[ "$result" == *"comes from 'http://archive.ubuntu.com/ubuntu"* ]] \
+  || { echo "FAIL: wrong origin attributed to the candidate: $result"; exit 1; }
+echo 'PASS: origin binds to the candidate entry, not the first table line'
+
+# Reverse ordering, the *** installed marker and the dpkg status entry must all
+# still resolve the official origin for the candidate.
+apt-cache(){
+  printf 'caddy:\n  Installed: 2.11.7\n  Candidate: 2.11.7\n  Version table:\n     2.6.2-14ubuntu1 500\n        500 http://archive.ubuntu.com/ubuntu resolute/universe amd64 Packages\n *** 2.11.7 500\n        500 https://dl.cloudsmith.io/public/caddy/stable/deb/deb stable/main amd64 Packages\n    100 /var/lib/dpkg/status\n'
+}
+set +e
+result=$( (caddy_repo_candidate) 2>&1 )
+rc=$?
+set -e
+[[ "$rc" == 0 && "$result" == '2.11.7' ]] \
+  || { echo "FAIL: official candidate rejected: $result"; exit 1; }
+echo 'PASS: installed *** candidate keeps the official origin'
+
+# A candidate whose version entry carries no repository line is ambiguous and
+# must be refused instead of guessed.
+apt-cache(){
+  printf 'caddy:\n  Installed: (none)\n  Candidate: 2.11.7\n  Version table:\n     2.11.7 500\n'
+}
+set +e
+result=$( (caddy_repo_candidate) 2>&1 )
+rc=$?
+set -e
+[[ "$rc" != 0 && "$result" == *'no repository origin'* ]] \
+  || { echo "FAIL: origin-less candidate accepted or misdescribed: $result"; exit 1; }
+echo 'PASS: candidate without any repository origin is refused'
+apt-cache(){
+  printf 'caddy:\n  Installed: (none)\n  Candidate: 2.11.7\n  Version table:\n     2.11.7 500\n        500 https://dl.cloudsmith.io/public/caddy/stable/deb/deb stable/main amd64 Packages\n'
+}
+
 # Supported-distribution matrix, asserted against the same fixtures as the
 # installer so the two APT entry points cannot drift apart.
 os_tmp="$(mktemp -d)"

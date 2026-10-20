@@ -54,6 +54,110 @@ MALFORMED_CASES = [
 
 SCRIPT_DIR_LINE = 'readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"'
 
+CLOUDSMITH = "https://dl.cloudsmith.io/public/caddy/stable/deb/deb stable/main amd64 Packages"
+UBUNTU = "http://archive.ubuntu.com/ubuntu resolute/universe amd64 Packages"
+
+
+def policy(candidate, *entry_lines, installed="(none)"):
+    """Assemble realistic `apt-cache policy caddy` stdout.
+
+    Each entry is a (version-table body) string exactly as apt prints it, so a
+    change in the parser has to keep working against the real layout.
+    """
+    return (
+        "caddy:\n"
+        f"  Installed: {installed}\n"
+        f"  Candidate: {candidate}\n"
+        "  Version table:\n"
+        + "".join(entry_lines)
+    )
+
+
+# (name, policy output, accepted?, needles expected in the failure text)
+# The order of version-table entries is significant: an origin belongs to the
+# version entry printed directly above it and to no other version.
+CANDIDATE_CASES = [
+    (
+        "official cloudsmith candidate",
+        policy("2.11.7", "     2.11.7 500\n", f"        500 {CLOUDSMITH}\n",
+               "     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n"),
+        True, (),
+    ),
+    (
+        "candidate from cloudsmith after an older universe version",
+        policy("2.11.7", "     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n",
+               "     2.11.7 500\n", f"        500 {CLOUDSMITH}\n"),
+        True, (),
+    ),
+    (
+        "universe-only candidate",
+        policy("2.6.2-14ubuntu1", "     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n"),
+        False, ("comes from 'http://archive.ubuntu.com/ubuntu", "not the official Caddy repository"),
+    ),
+    (
+        # The regression: a non-candidate version listed first carries the
+        # Cloudsmith origin while the actual candidate belongs to universe.
+        "older cloudsmith version listed before a universe candidate",
+        policy("2.6.2-14ubuntu1", installed="2.11.7",
+               *["     2.11.7 500\n", f"        500 {CLOUDSMITH}\n",
+                 " *** 2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n",
+                 "    100 /var/lib/dpkg/status\n"]),
+        False, ("comes from 'http://archive.ubuntu.com/ubuntu", "not the official Caddy repository"),
+    ),
+    (
+        "installed candidate marked with *** alongside the dpkg status entry",
+        policy("2.11.7", installed="2.11.7",
+               *[" *** 2.11.7 500\n", f"        500 {CLOUDSMITH}\n",
+                 "    100 /var/lib/dpkg/status\n",
+                 "     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n"]),
+        True, (),
+    ),
+    (
+        # The dpkg status database must never be read as the candidate origin.
+        "status database only after the candidate entry",
+        policy("2.11.7", installed="2.11.7",
+               *[" *** 2.11.7 500\n", "    100 /var/lib/dpkg/status\n"]),
+        False, ("no repository origin",),
+    ),
+    (
+        "same version published by universe and cloudsmith",
+        policy("2.11.7", "     2.11.7 500\n", f"        500 {UBUNTU}\n", f"        500 {CLOUDSMITH}\n"),
+        True, (),
+    ),
+    (
+        "repository-update warning does not supply an origin",
+        "W: Failed to fetch https://dl.cloudsmith.io/public/caddy/stable/deb/binary-amd64/Packages  404 Not Found\n"
+        "W: Some index files failed to download.\n"
+        + policy("2.6.2-14ubuntu1", "     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n"),
+        False, ("comes from 'http://archive.ubuntu.com/ubuntu", "not the official Caddy repository"),
+    ),
+    (
+        "candidate version with no origin line at all",
+        policy("2.11.7", "     2.11.7 500\n"),
+        False, ("no repository origin",),
+    ),
+    (
+        # Some apt builds mark the pinned or held entry with "::" instead of
+        # "***"; the version, not the marker, must carry the origin.
+        "candidate marked with the double-colon variant",
+        policy("2.11.7", installed="2.6.2-14ubuntu1",
+               *["     2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n",
+                 "  :: 2.11.7 500\n", f"        500 {CLOUDSMITH}\n"]),
+        True, (),
+    ),
+    (
+        "malformed version entry without a priority",
+        policy("2.11.7", "     2.11.7\n", f"        500 {CLOUDSMITH}\n"),
+        False, ("no repository origin",),
+    ),
+    (
+        "empty version table",
+        policy("2.11.7"),
+        False, ("no repository origin",),
+    ),
+]
+
+
 
 def script_source(path):
     """The script body without its final invocation line.
@@ -299,10 +403,42 @@ caddy_repo_candidate
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.strip(), "2.11.7")
 
-    def test_no_candidate_at_all_is_rejected(self):
-        rc, out, err = self.run_candidate("caddy:\n  Installed: (none)\n  Candidate: (none)\n  Version table:\n")
+    def test_origin_is_bound_to_the_candidates_own_version_entry(self):
+        # Every fixture is run through the installer and the updater, which must
+        # reach the same decision from the same policy output.
+        for name, text, accept, needles in CANDIDATE_CASES:
+            for script in (INSTALLER, UPDATER):
+                with self.subTest(case=name, script=script.name):
+                    rc, out, err = self.run_candidate(text, script=script)
+                    if accept:
+                        self.assertEqual(rc, 0, err)
+                        self.assertEqual(out.strip(), text.split("Candidate: ")[1].split("\n")[0])
+                    else:
+                        self.assertEqual(rc, 1, err)
+                        for needle in needles:
+                            self.assertIn(needle, err)
+
+    def test_rejection_names_the_candidates_origin_not_the_first_line(self):
+        # A wrong attribution must not be masked by a generic message: the
+        # reported origin has to be the one that publishes the candidate.
+        wrong = policy("2.6.2-14ubuntu1", installed="2.11.7",
+                       *["     2.11.7 500\n", f"        500 {CLOUDSMITH}\n",
+                         " *** 2.6.2-14ubuntu1 500\n", f"        500 {UBUNTU}\n"])
+        rc, out, err = self.run_candidate(wrong)
         self.assertEqual(rc, 1)
-        self.assertIn("No Caddy APT candidate available.", err)
+        self.assertIn("comes from 'http://archive.ubuntu.com/ubuntu", err)
+        self.assertNotIn("comes from 'https://dl.cloudsmith.io", err)
+
+    def test_no_candidate_at_all_is_rejected(self):
+        for script in (INSTALLER, UPDATER):
+            with self.subTest(script=script.name):
+                rc, out, err = self.run_candidate(
+                    "caddy:\n  Installed: (none)\n  Candidate: (none)\n  Version table:\n",
+                    script=script,
+                )
+                self.assertEqual(rc, 1)
+                self.assertIn("No Caddy", err)
+                self.assertIn("candidate", err)
 
     def test_candidate_version_is_not_contaminated_by_other_output(self):
         # APT chatter on stdout must not become the version string.

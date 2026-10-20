@@ -58,6 +58,12 @@ Two Ubuntu-only conditions are handled explicitly:
   resolve to that distribution build, so the installer and updater assert that
   the candidate version really comes from
   `https://dl.cloudsmith.io/public/caddy/stable/` before stopping anything.
+  The origin is taken from the candidate's own version-table entry: a
+  repository line belongs to the version printed directly above it, while the
+  `Installed` and `Candidate` header lines repeat versions with no origin at
+  all, so a version match anywhere in the output would attribute the first
+  listed repository to the wrong version. A candidate with no origin line is
+  refused rather than guessed.
 - The dependency set is limited to `ca-certificates curl gpg`, which live in
   `main` on both distributions. The former `debian-keyring`,
   `debian-archive-keyring` and `apt-transport-https` packages are not consulted
@@ -723,9 +729,15 @@ derivatives, and missing/empty/`ID`-less `/etc/os-release`, for the installer
 and the updater alike. It also asserts that the two scripts share one
 distribution policy and one repository-origin policy, that the compatibility
 entry point forwards instead of reimplementing, and that the APT candidate is
-rejected unless it comes from the official Caddy repository. On a real Linux
-host it additionally runs the read-only `--check-os` probe against the actual
-`/etc/os-release`; that self-skips where no such file exists.
+rejected unless its own version-table entry is published by the official Caddy
+repository. The origin fixtures run through both entry points and cover a
+`universe`-only candidate, an older Cloudsmith version listed before a
+`universe` candidate (which must still be rejected), a Cloudsmith candidate
+listed after a `universe` version, the `***` and `::` installed markers, the
+`/var/lib/dpkg/status` entry, a candidate with no origin line, a malformed
+version entry, an empty table, and APT warning text around the table. On a real
+Linux host it additionally runs the read-only `--check-os` probe against the
+actual `/etc/os-release`; that self-skips where no such file exists.
 
 **Follow-up validation.** Owner: repository maintainer. Trigger: before the
 first Ubuntu Caddy deployment. Acceptance criteria: run
