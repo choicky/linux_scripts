@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upgrade Caddy Stable on the standard linux_scripts layout.
+# Upgrade Caddy Stable on Debian 12/13 and Ubuntu 24.04/26.04 LTS.
 # The matching prebuilt custom binary is downloaded and verified before APT
 # changes the installed package, so an unavailable custom release is harmless.
 # Even when no upgrade is needed, the shared normalization component still
@@ -14,7 +14,11 @@ readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
 readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
+readonly OS_RELEASE="/etc/os-release"
+readonly CADDY_REPO_PREFIX="https://dl.cloudsmith.io/public/caddy/stable/"
+readonly SUPPORTED_DISTRIBUTIONS="Debian 12, Debian 13, Ubuntu 24.04 LTS, Ubuntu 26.04 LTS"
 
+DISTRO_LABEL=""
 BUILD_DIR=""
 BACKUP_CUSTOM=""
 SERVICE_WAS_ACTIVE=false
@@ -33,20 +37,60 @@ version_of(){
   "$1" version | awk '{print $1}'
 }
 
+require_supported_os(){
+  [[ -f "$OS_RELEASE" && -r "$OS_RELEASE" && -s "$OS_RELEASE" ]] \
+    || die "Cannot read a non-empty regular file at $OS_RELEASE; refusing to guess the distribution."
+  local ID="" VERSION_ID=""
+  # shellcheck disable=SC1090
+  . "$OS_RELEASE" || die "$OS_RELEASE is not a parsable os-release file."
+  case "${ID:-}" in
+    debian)
+      case "${VERSION_ID:-}" in
+        12|13) DISTRO_LABEL="Debian ${VERSION_ID}"; return 0;;
+        *) die "Debian '${VERSION_ID:-unknown}' is not supported. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+      esac;;
+    ubuntu)
+      case "${VERSION_ID:-}" in
+        24.04|26.04) DISTRO_LABEL="Ubuntu ${VERSION_ID} LTS"; return 0;;
+        *) die "Ubuntu '${VERSION_ID:-unknown}' is not supported. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+      esac;;
+    "") die "$OS_RELEASE has no ID field; refusing to guess the distribution.";;
+    *) die "Distribution '${ID}' is not supported. Having apt-get is not sufficient. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+  esac
+}
+
+caddy_repo_candidate(){
+  # Echo the APT candidate version, but only when the candidate is published by
+  # the official Caddy repository. Ubuntu also ships its own distro build of
+  # caddy (Debian does not), so a version alone cannot prove that the
+  # caddy-stable source actually loaded; without this check a broken source
+  # could make the updater target, and then install, the distribution build.
+  local policy raw origin
+  policy="$(LC_ALL=C apt-cache policy caddy)"
+  raw="$(sed -n 's/^ *Candidate: \([^ ]*\).*/\1/p' <<<"$policy")"
+  [[ -n "$raw" && "$raw" != '(none)' ]] || die "No Caddy candidate is available from APT."
+  origin="$(awk -v want="$raw" '
+    { for (i = 1; i <= NF; i++) if ($i == want) { seen = 1; break } }
+    seen && $1 ~ /^[0-9]+$/ && $2 ~ /^https?:/ { print $2; exit }
+  ' <<<"$policy")"
+  [[ "$origin" == "$CADDY_REPO_PREFIX"* ]] \
+    || die "The Caddy APT candidate $raw comes from '${origin:-unknown origin}', not the official Caddy repository at ${CADDY_REPO_PREFIX}. The caddy-stable source probably failed to load (network or signing-key problem) and this is a distribution build; fix the repository before continuing."
+  printf '%s\n' "$raw"
+}
+
 preflight(){
   [[ ${EUID} -eq 0 ]] || die "Run this script as root."
-  . /etc/os-release
-  [[ ${ID:-} == debian ]] || die "Only Debian is supported."
-  case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
+  require_supported_os
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   [[ -f "$CONFIG" ]] || die "Missing $CONFIG"
-  [[ -x "$CADDY_DEFAULT" ]] || die "Missing $CADDY_DEFAULT; use install-caddy-debian.sh first."
-  [[ -x "$CADDY_CUSTOM" ]] || die "Missing $CADDY_CUSTOM; use install-caddy-debian.sh first."
+  [[ -x "$CADDY_DEFAULT" ]] || die "Missing $CADDY_DEFAULT; use install-caddy-apt.sh first."
+  [[ -x "$CADDY_CUSTOM" ]] || die "Missing $CADDY_CUSTOM; use install-caddy-apt.sh first."
   [[ -L /usr/bin/caddy ]] || die "/usr/bin/caddy is not the expected symlink."
   [[ "$(readlink -f /usr/bin/caddy)" == "$CADDY_CUSTOM" ]] || die "/usr/bin/caddy does not point to $CADDY_CUSTOM."
   dpkg-query -W -f='${Status}\n' caddy 2>/dev/null | grep -Fxq 'install ok installed' || die "APT package caddy is not installed."
   dpkg-divert --list /usr/bin/caddy | grep -Fq "$CADDY_DEFAULT" || die "Expected dpkg diversion to $CADDY_DEFAULT is missing."
   case "$(dpkg --print-architecture)" in amd64) ARCH=amd64;; arm64) ARCH=arm64;; *) die "Unsupported architecture.";; esac
+  log "Environment: ${DISTRO_LABEL}, architecture: ${ARCH}"
   systemctl is-active --quiet caddy && SERVICE_WAS_ACTIVE=true
   systemctl is-enabled --quiet caddy && SERVICE_WAS_ENABLED=true
   return 0
@@ -55,8 +99,7 @@ preflight(){
 candidate_version(){
   apt-get update >&2
   local raw
-  raw="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
-  [[ -n "$raw" && "$raw" != "(none)" ]] || die "No Caddy candidate is available from APT."
+  raw="$(caddy_repo_candidate)"
   raw="${raw#*:}"
   if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-+~].*)?$ ]]; then
     printf 'v%s\n' "${BASH_REMATCH[1]}"
@@ -186,7 +229,7 @@ main(){
   local current target
   current="$(version_of "$CADDY_DEFAULT")"
   target="$(candidate_version)"
-  PACKAGE_VERSION="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
+  PACKAGE_VERSION="$(caddy_repo_candidate)"
 
   log "Caddy versions"
   printf 'Installed APT Caddy: %s\n' "$current"

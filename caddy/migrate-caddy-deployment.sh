@@ -3,7 +3,7 @@
 # migrate-caddy-deployment.sh
 #
 # One-time, evidence-based migration from a legacy/manual Caddy deployment to
-# the standard layout established by install-caddy-debian.sh plus the shared
+# the standard layout established by install-caddy-apt.sh plus the shared
 # normalization component.
 #
 # Legacy arrangements are detected from first-hand evidence rather than
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly INSTALLER="${SCRIPT_DIR}/install-caddy-debian.sh"
+readonly INSTALLER="${SCRIPT_DIR}/install-caddy-apt.sh"
 readonly NORMALIZE="${SCRIPT_DIR}/normalize-caddy-services.sh"
 
 readonly CONFIG="/etc/caddy/caddy.jsonc"
@@ -581,6 +581,13 @@ main(){
   for command in systemctl runuser install cp sed grep find awk chown chmod stat dpkg-divert; do
     command -v "$command" >/dev/null 2>&1 || die "Missing required command: $command"
   done
+  # The installer owns the supported-distribution matrix. Check it before
+  # stopping services or moving any legacy path, so an unsupported host cannot
+  # be left mid-migration by a failure that happens later inside the installer.
+  local detected_os
+  detected_os="$(bash "$INSTALLER" --check-os)" \
+    || die "This distribution is not supported by the Caddy APT installer; nothing was changed."
+  log "Supported distribution: ${detected_os}"
 
   detect_legacy_layout
   classify_singbox_references

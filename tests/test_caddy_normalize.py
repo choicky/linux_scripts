@@ -831,7 +831,7 @@ esac
         (self.fs / "usr/bin/caddy").unlink()
         r = self._run(["--caddy"])
         self.assertEqual(r.returncode, 1)
-        self.assertIn("run caddy/install-caddy-debian.sh", r.stderr)
+        self.assertIn("run caddy/install-caddy-apt.sh", r.stderr)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install Caddy Stable package support on Debian 12/13 and select the matching
-# prebuilt custom binary from choicky/caddy-custom-build.
+# Install Caddy Stable package support on Debian 12/13 and Ubuntu 24.04/26.04
+# and select the matching prebuilt custom binary from choicky/caddy-custom-build.
 # The managed runtime state (drop-in, identity, permissions) is established by
 # the shared normalization component, not duplicated here.
 set -Eeuo pipefail
@@ -13,7 +13,12 @@ readonly CADDY_CUSTOM="/usr/bin/caddy.custom"
 readonly RELEASE_REPO="choicky/caddy-custom-build"
 readonly MODULE_L4="github.com/mholt/caddy-l4"
 readonly MODULE_CF_IP="github.com/WeidiDeng/caddy-cloudflare-ip"
+readonly OS_RELEASE="/etc/os-release"
+readonly CADDY_REPO_PREFIX="https://dl.cloudsmith.io/public/caddy/stable/"
+readonly SUPPORTED_DISTRIBUTIONS="Debian 12, Debian 13, Ubuntu 24.04 LTS, Ubuntu 26.04 LTS"
+DISTRO_LABEL=""
 NO_START=false
+CHECK_OS=false
 BUILD_DIR=""
 SERVICE_TOUCHED=false
 RUNTIME_READY=false
@@ -42,15 +47,53 @@ trap cleanup EXIT
 
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
-usage(){ printf 'Usage: %s [--no-start]\n' "$0"; }
+usage(){ printf 'Usage: %s [--no-start] [--check-os]\n' "$0"; }
 
-parse_args(){ while (( $# )); do case "$1" in --no-start) NO_START=true;; -h|--help) usage; exit 0;; *) usage >&2; die "Unknown option: $1";; esac; shift; done; }
+parse_args(){ while (( $# )); do case "$1" in --no-start) NO_START=true;; --check-os) CHECK_OS=true;; -h|--help) usage; exit 0;; *) usage >&2; die "Unknown option: $1";; esac; shift; done; }
+
+require_supported_os(){
+  [[ -f "$OS_RELEASE" && -r "$OS_RELEASE" && -s "$OS_RELEASE" ]] \
+    || die "Cannot read a non-empty regular file at $OS_RELEASE; refusing to guess the distribution."
+  local ID="" VERSION_ID=""
+  # shellcheck disable=SC1090
+  . "$OS_RELEASE" || die "$OS_RELEASE is not a parsable os-release file."
+  case "${ID:-}" in
+    debian)
+      case "${VERSION_ID:-}" in
+        12|13) DISTRO_LABEL="Debian ${VERSION_ID}"; return 0;;
+        *) die "Debian '${VERSION_ID:-unknown}' is not supported. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+      esac;;
+    ubuntu)
+      case "${VERSION_ID:-}" in
+        24.04|26.04) DISTRO_LABEL="Ubuntu ${VERSION_ID} LTS"; return 0;;
+        *) die "Ubuntu '${VERSION_ID:-unknown}' is not supported. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+      esac;;
+    "") die "$OS_RELEASE has no ID field; refusing to guess the distribution.";;
+    *) die "Distribution '${ID}' is not supported. Having apt-get is not sufficient. Supported: ${SUPPORTED_DISTRIBUTIONS}.";;
+  esac
+}
+
+caddy_repo_candidate(){
+  # Echo the APT candidate version, but only when the candidate is published by
+  # the official Caddy repository. Ubuntu also ships its own distro build of
+  # caddy (Debian does not), so a version alone cannot prove that the
+  # caddy-stable source actually loaded.
+  local policy raw origin
+  policy="$(LC_ALL=C apt-cache policy caddy)"
+  raw="$(sed -n 's/^ *Candidate: \([^ ]*\).*/\1/p' <<<"$policy")"
+  [[ -n "$raw" && "$raw" != '(none)' ]] || die "No Caddy APT candidate available."
+  origin="$(awk -v want="$raw" '
+    { for (i = 1; i <= NF; i++) if ($i == want) { seen = 1; break } }
+    seen && $1 ~ /^[0-9]+$/ && $2 ~ /^https?:/ { print $2; exit }
+  ' <<<"$policy")"
+  [[ "$origin" == "$CADDY_REPO_PREFIX"* ]] \
+    || die "The Caddy APT candidate $raw comes from '${origin:-unknown origin}', not the official Caddy repository at ${CADDY_REPO_PREFIX}. The caddy-stable source probably failed to load (network or signing-key problem) and this is a distribution build; fix the repository before continuing."
+  printf '%s\n' "$raw"
+}
 
 preflight(){
   [[ ${EUID} -eq 0 ]] || die "Run this script as root."
-  . /etc/os-release
-  [[ ${ID:-} == debian ]] || die "Only Debian is supported."
-  case "${VERSION_ID:-}" in 12|13);; *) die "Only Debian 12 and Debian 13 are supported.";; esac
+  require_supported_os
   getent passwd www-data >/dev/null || die "User 'www-data' does not exist."
   getent group www-data >/dev/null || die "Group 'www-data' does not exist."
   [[ ! -e /usr/local/bin/caddy ]] || die "Existing /usr/local/bin/caddy detected. Use caddy/migrate-caddy-deployment.sh."
@@ -58,21 +101,24 @@ preflight(){
   case "$(systemctl is-enabled caddy 2>/dev/null || true)" in
     masked|masked-runtime) WAS_MASKED=true;;
   esac
-  log "Environment: Debian ${VERSION_ID}, architecture: ${ARCH}"
+  log "Environment: ${DISTRO_LABEL}, architecture: ${ARCH}"
 }
 
 install_caddy(){
   log "Preparing the official Caddy APT repository"
 
   apt-get update
-  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
+  # The Cloudsmith repository carries its own signed-by keyring and modern apt
+  # speaks HTTPS natively, so debian-keyring/debian-archive-keyring/
+  # apt-transport-https are not consulted here. They are also universe-only
+  # packages on Ubuntu, where a disabled universe pocket would abort install.
+  apt-get install -y ca-certificates curl gpg
   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
   chmod 0644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
   apt-get update
   # Resolve the repository candidate before touching the running service.
-  PACKAGE_VERSION="$(LC_ALL=C apt-cache policy caddy | awk '/Candidate:/ {print $2; exit}')"
-  [[ -n "$PACKAGE_VERSION" && "$PACKAGE_VERSION" != '(none)' ]] || die "No Caddy APT candidate available."
+  PACKAGE_VERSION="$(caddy_repo_candidate)"
   CADDY_VERSION="v${PACKAGE_VERSION#*:}"
   [[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Unsupported Caddy package version: $PACKAGE_VERSION"
 }
@@ -176,5 +222,16 @@ start_caddy(){
   systemctl is-active --quiet caddy || die "Caddy is not active."
 }
 
-main(){ parse_args "$@"; preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; expose_unit; setup_service; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version; }
+main(){
+  parse_args "$@"
+  # --check-os reports the detected distribution without root privileges and
+  # without touching APT, systemd or files, so callers can validate the
+  # supported matrix before doing any work.
+  if [[ "$CHECK_OS" == true ]]; then
+    require_supported_os
+    printf '%s\n' "$DISTRO_LABEL"
+    exit 0
+  fi
+  preflight; install_caddy; download_custom_caddy; install_caddy_package; setup_custom_binary; expose_unit; setup_service; RUNTIME_READY=true; validate_installation; start_caddy; printf '\nCaddy installation completed.\n'; /usr/bin/caddy version;
+}
 main "$@"
