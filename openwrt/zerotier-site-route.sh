@@ -90,6 +90,7 @@ check() {
     info "PASS: $ROLE via $ZT_DEV; two /25 routes selected; ZeroTier NAT not detected"
 }
 nat_check() {
+    [ -n "${ZT_DEV:-}" ] || die "ZeroTier device not resolved"
     section=$(zt_section)
     [ -n "$section" ] || die "ZeroTier UCI section missing"
     [ "$(uci -q get "zerotier.$section.fw_allow_masq" 2>/dev/null || true)" != 1 ] ||
@@ -97,14 +98,14 @@ nat_check() {
     command -v nft >/dev/null || die "nft missing"
     rules=$(nft list chain inet fw4 srcnat 2>&1) ||
         die "cannot inspect active NAT: $rules"
-    if printf '%s\n' "$rules" |
-        grep -E 'masquerade.*ZeroTier|ZeroTier.*masquerade' >/dev/null; then
-        die "ZeroTier NAT still active"
+    if printf '%s\n' "$rules" | grep -F "$ZT_DEV" | grep -q masquerade; then
+        die "target ZeroTier NAT still active"
     fi
     [ -f /var/run/zerotier-one/_fw4/srcnat.nft ] ||
         die "ZeroTier NAT include missing"
-    if grep -q masquerade /var/run/zerotier-one/_fw4/srcnat.nft; then
-        die "ZeroTier generated NAT rule remains"
+    if grep -F "$ZT_DEV" /var/run/zerotier-one/_fw4/srcnat.nft |
+        grep -q masquerade; then
+        die "target ZeroTier generated NAT rule remains"
     fi
 }
 cron_add() {
