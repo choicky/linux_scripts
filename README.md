@@ -24,6 +24,7 @@ one place and cannot drift apart.
 - `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration, verifies that every effective certificate/key reference is actually readable by `www-data` before any identity change or activation, and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
 - `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes, and on a failed restart rolls the applied changes back and recovers the previously running services.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
+- `openwrt/zerotier-site-route.sh` — shared R3S/R4S ZeroTier site-to-site route installer; uses two more-specific /25 routes per peer LAN to override a competing Tailscale /24, without modifying Tailscale or sing-box. Requires an existing authorized ZeroTier network. See usage below.
 - `openwrt/R4S-momo-to-native-sing-box.md` — R4S/ImmortalWrt migration record from OpenWrt-Momo core_only to native sing-box under procd, including Tailscale state, verification and rollback (separate from Debian scripts).
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
@@ -748,3 +749,19 @@ first Ubuntu Caddy deployment. Acceptance criteria: run
 the managed `www-data` layout, `/usr/bin/caddy` resolves to `caddy.custom`, and
 a second run is a normalizing no-op. Mocked tests prove control flow and
 refusals; they do not prove APT resolution or live systemd behaviour on Ubuntu.
+
+## OpenWrt ZeroTier R3S/R4S site routes
+
+Both routers use `openwrt/zerotier-site-route.sh`, with only the role different. The script assumes ZeroTier network `233ccaac273aa22d` is already joined and authorized, and that R3S uses LAN `192.168.13.0/24` / ZeroTier `192.168.192.13`, while R4S uses LAN `192.168.10.0/24` / ZeroTier `192.168.192.10`. It discovers the device name using `zerotier-cli listnetworks` rather than hard-coding `ztr4n7adqk`.
+
+On each router, download the script to a local file (do not pipe remote content directly into the shell), inspect it, then run:
+
+```sh
+sh zerotier-site-route.sh install r3s  # only on R3S
+sh zerotier-site-route.sh install r4s  # only on R4S
+/usr/sbin/zerotier-site-route check
+```
+
+The installer creates `/usr/sbin/zerotier-site-route`, `/etc/zerotier-site-route.conf`, and a single root cron entry. `reconcile` adds the two /25 routes when the ZeroTier network is ready. On R3S, installation removes the known legacy cron entry invoking `/usr/sbin/zerotier-lan-routes` but deliberately does not delete the legacy script. The installer removes `fw_allow_masq` from the matching ZeroTier UCI section but does **not** reload ZeroTier or the firewall. On an established management connection, separately run `/usr/sbin/zerotier-site-route sync-nat` after checking for a fallback access path; this regenerates ZeroTier firewall includes and reloads fw4 only if the generated NAT include contains no masquerade rule. `uninstall` removes only the managed /25 routes, config and cron; it does not restore NAT or uninstall ZeroTier.
+
+This is a router-specific tool, not a general ZeroTier provisioning system. It does not create ZeroTier identities, authorize devices in Central, modify controller Managed Routes, or guarantee LAN client forwarding/firewall acceptance. Test real clients in both directions after installation. Do not treat `check` as proof of client-to-client connectivity or reboot persistence. The per-minute cron reconciliation is a deliberate, low-complexity recovery mechanism, not a netifd hotplug integration.
