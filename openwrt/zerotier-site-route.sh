@@ -117,6 +117,19 @@ firewall_check() {
         die "ZeroTier firewall input not enabled"
     [ "$(uci -q get "zerotier.$section.fw_allow_forward" 2>/dev/null || true)" = 1 ] ||
         die "ZeroTier firewall forwarding not enabled"
+    # UCI alone is insufficient: zerotier-fw4 writes its own nft includes.
+    fwd_file=/var/run/zerotier-one/_fw4/forward.nft
+    [ -f "$fwd_file" ] || die "ZeroTier forward include missing"
+    grep -F "iifname $ZT_DEV " "$fwd_file" | grep -q 'Accept ZeroTier input forward' ||
+        die "ZeroTier incoming forwarding rule missing"
+    grep -F "oifname $ZT_DEV " "$fwd_file" | grep -q 'Accept ZeroTier output forward' ||
+        die "ZeroTier outgoing forwarding rule missing"
+    live_forward=$(nft list chain inet fw4 forward 2>&1) ||
+        die "cannot inspect active forwarding: $live_forward"
+    printf '%s\n' "$live_forward" | grep -F "iifname \"$ZT_DEV\"" | grep -q accept ||
+        die "ZeroTier incoming forwarding rule not active"
+    printf '%s\n' "$live_forward" | grep -F "oifname \"$ZT_DEV\"" | grep -q accept ||
+        die "ZeroTier outgoing forwarding rule not active"
     [ "$(uci -q get "firewall.$WAN_RULE.name" 2>/dev/null || true)" = 'ZeroTier-Site-UDP-9993' ] ||
         die "managed UDP 9993 firewall rule missing"
     [ "$(uci -q get "firewall.$WAN_RULE.proto" 2>/dev/null || true)" = udp ] ||
@@ -153,6 +166,11 @@ firewall_setup() {
     uci commit zerotier
     uci commit firewall
     /etc/init.d/firewall reload || die "firewall reload failed; inspect firewall state"
+    command -v zerotier-fw4 >/dev/null || die "zerotier-fw4 missing; cannot generate overlay forwarding rules"
+    zerotier-fw4 -i "$ZT_DEV" || die "zerotier-fw4 failed to generate interface rules"
+    # The upstream generator can skip forward generation if input already exists.
+    # Do not report success until both generated and live forward rules are present.
+    firewall_check
     info "ZeroTier input/forward allowed, masquerading disabled; WAN UDP 9993 allowed"
 }
 cron_add() {
