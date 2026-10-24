@@ -101,10 +101,9 @@ nat_check() {
     if printf '%s\n' "$rules" | grep -F "$ZT_DEV" | grep -q masquerade; then
         die "target ZeroTier NAT still active"
     fi
-    [ -f /var/run/zerotier-one/_fw4/srcnat.nft ] ||
-        die "ZeroTier NAT include missing"
-    if grep -F "$ZT_DEV" /var/run/zerotier-one/_fw4/srcnat.nft |
-        grep -q masquerade; then
+    nat_file=/var/run/zerotier-one/_fw4/srcnat.nft
+    if [ -f "$nat_file" ] &&
+        grep -F "$ZT_DEV" "$nat_file" | grep -q masquerade; then
         die "target ZeroTier generated NAT rule remains"
     fi
 }
