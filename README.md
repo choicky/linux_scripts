@@ -752,16 +752,20 @@ refusals; they do not prove APT resolution or live systemd behaviour on Ubuntu.
 
 ## OpenWrt ZeroTier R3S/R4S site routes
 
-Both routers use `openwrt/zerotier-site-route.sh`, with only the role different. The script assumes ZeroTier network `233ccaac273aa22d` is already joined and authorized, and that R3S uses LAN `192.168.13.0/24` / ZeroTier `192.168.192.13`, while R4S uses LAN `192.168.10.0/24` / ZeroTier `192.168.192.10`. It discovers the device name using `zerotier-cli listnetworks` rather than hard-coding `ztr4n7adqk`. Installation requires the router's own LAN address to match its role (`192.168.13.1/24` for R3S or `192.168.10.1/24` for R4S); a mismatch stops before any configuration changes.
+Both routers use `openwrt/zerotier-site-route.sh`, with only the role different. ZeroTier network `233ccaac273aa22d` must already be joined and authorized in Central. R3S has LAN `192.168.13.0/24`, gateway `192.168.13.1`, and ZeroTier IP `192.168.192.13`; R4S has LAN `192.168.10.0/24`, gateway `192.168.10.1`, and ZeroTier IP `192.168.192.10`. The installer validates the local LAN address and discovers the ZeroTier device dynamically. It does not install, restart, or rejoin ZeroTier, nor modify Tailscale or sing-box.
 
-On each router, download the script to a local file (do not pipe remote content directly into the shell), inspect it, then run:
+Download the script to a local file, inspect it, and run on the appropriate router:
 
 ```sh
-sh zerotier-site-route.sh install r3s  # only on R3S
-sh zerotier-site-route.sh install r4s  # only on R4S
+sh zerotier-site-route.sh install r3s  # R3S only
+sh zerotier-site-route.sh install r4s  # R4S only
 /usr/sbin/zerotier-site-route check
 ```
 
-The installer uses default OpenWrt `cp`, `chmod`, and `mv` utilities. It installs `/usr/sbin/zerotier-site-route`, `/etc/zerotier-site-route.conf`, and a single root cron entry. `reconcile` restores the two /25 routes when ZeroTier is ready. It removes the legacy R3S cron entry for `/usr/sbin/zerotier-lan-routes` without deleting that file. It removes the matching ZeroTier network's `fw_allow_masq` UCI setting but deliberately does not edit generated nftables files, reload the firewall, or restart ZeroTier. If existing NAT rules remain active, `check` fails; clear them separately during migration using the router's actual ZeroTier integration. `uninstall` removes only the script-managed routes, config and cron; it does not restore NAT or uninstall ZeroTier.
+Installation configures two more-specific /25 routes to the other LAN (to take precedence over an overlapping Tailscale /24 route), creates one root cron entry to reconcile those routes every minute, and removes the exact legacy R3S cron entry for `/usr/sbin/zerotier-lan-routes` without deleting the legacy file. The cron job only repairs routes, not firewall rules.
 
-This is a router-specific tool, not a general ZeroTier provisioning system. It does not create ZeroTier identities, authorize devices in Central, modify controller Managed Routes, or guarantee LAN client forwarding/firewall acceptance. Test real clients in both directions after installation. Do not treat `check` as proof of client-to-client connectivity or reboot persistence. The per-minute cron reconciliation is a deliberate, low-complexity recovery mechanism, not a netifd hotplug integration.
+For the already-installed ImmortalWrt `zerotier-fw4` integration, installation sets `fw_allow_input=1`, `fw_allow_forward=1`, and removes `fw_allow_masq` for the matching ZeroTier network. It also creates or reconciles a named IPv4 WAN input firewall rule, `zerotier_site_udp_9993` (`ZeroTier-Site-UDP-9993`), accepting UDP destination port 9993. This is **not** a port-forward/DNAT rule; no UPnP or blanket UDP allowance is added. The installer validates with `fw4 check` before committing and reloads the firewall; it never restarts ZeroTier. If another rule occupies the managed section name, installation refuses to overwrite it. A firewall reload is not equivalent to regeneration of every stale ZeroTier-generated nft include: `check` still fails if old masquerade rules remain and they must be addressed separately.
+
+`check` validates the routes, ZeroTier NAT state, and managed firewall UCI settings; it does **not** prove end-to-end client reachability or the runtime effect of the generated forward rules. Verify actual LAN clients in both directions, UDP reachability, and recovery after a reboot. The script does not configure ZeroTier Central Managed Routes or external upstream NAT/port mapping. Official ZeroTier guidance says manual port forwarding is normally unnecessary and unrestricted outbound UDP is preferable for peer-to-peer connectivity.
+
+`uninstall` removes the managed routes, cron entry, script/config files, and the named UDP 9993 firewall rule if it still has the expected name. It leaves ZeroTier's input/forward/masquerade UCI settings as configured and does not uninstall ZeroTier. The router's firewall configuration must have a `wan` zone and working fw4 service; this tool is specific to the two named routers, not a generic ZeroTier provisioning system.
