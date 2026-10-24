@@ -8,6 +8,7 @@ CONFIG=/etc/zerotier-site-route.conf
 SELF=/usr/sbin/zerotier-site-route
 CRON=/etc/crontabs/root
 TAG='# zerotier-site-route managed'
+WAN_RULE=zerotier_site_udp_9993
 ACTION=${1:-}
 ROLE=${2:-}
 
@@ -87,6 +88,7 @@ check() {
             die "route selection incorrect: $addr"
     done
     nat_check
+    firewall_check
     info "PASS: $ROLE via $ZT_DEV; two /25 routes selected; ZeroTier NAT not detected"
 }
 nat_check() {
@@ -107,6 +109,52 @@ nat_check() {
         die "target ZeroTier generated NAT rule remains"
     fi
 }
+# The installed zerotier-fw4 integration owns overlay input/forward rules.
+# Do not create a second firewall zone or modify unrelated VPN rules.
+firewall_check() {
+    section=$(zt_section)
+    [ "$(uci -q get "zerotier.$section.fw_allow_input" 2>/dev/null || true)" = 1 ] ||
+        die "ZeroTier firewall input not enabled"
+    [ "$(uci -q get "zerotier.$section.fw_allow_forward" 2>/dev/null || true)" = 1 ] ||
+        die "ZeroTier firewall forwarding not enabled"
+    [ "$(uci -q get "firewall.$WAN_RULE.name" 2>/dev/null || true)" = 'ZeroTier-Site-UDP-9993' ] ||
+        die "managed UDP 9993 firewall rule missing"
+    [ "$(uci -q get "firewall.$WAN_RULE.proto" 2>/dev/null || true)" = udp ] ||
+        die "managed UDP 9993 protocol incorrect"
+    [ "$(uci -q get "firewall.$WAN_RULE.dest_port" 2>/dev/null || true)" = 9993 ] ||
+        die "managed UDP 9993 port incorrect"
+    [ "$(uci -q get "firewall.$WAN_RULE.target" 2>/dev/null || true)" = ACCEPT ] ||
+        die "managed UDP 9993 rule not accepting"
+    [ "$(uci -q get "firewall.$WAN_RULE.src" 2>/dev/null || true)" = wan ] ||
+        die "managed UDP 9993 rule not restricted to WAN"
+}
+firewall_setup() {
+    section=$(zt_section)
+    [ -n "$section" ] || die "ZeroTier UCI network section missing"
+    command -v fw4 >/dev/null || die "fw4 missing"
+    [ -x /etc/init.d/firewall ] || die "firewall service missing"
+    if uci -q get "firewall.$WAN_RULE" >/dev/null 2>&1; then
+        [ "$(uci -q get "firewall.$WAN_RULE.name" 2>/dev/null || true)" = 'ZeroTier-Site-UDP-9993' ] ||
+            die "firewall section $WAN_RULE belongs to another configuration"
+    fi
+    uci set "zerotier.$section.fw_allow_input=1"
+    uci set "zerotier.$section.fw_allow_forward=1"
+    uci -q delete "zerotier.$section.fw_allow_masq" || true
+    uci set "firewall.$WAN_RULE=rule"
+    uci set "firewall.$WAN_RULE.name=ZeroTier-Site-UDP-9993"
+    uci set "firewall.$WAN_RULE.src=wan"
+    uci set "firewall.$WAN_RULE.proto=udp"
+    uci set "firewall.$WAN_RULE.dest_port=9993"
+    uci set "firewall.$WAN_RULE.target=ACCEPT"
+    uci set "firewall.$WAN_RULE.family=ipv4"
+    uci set "firewall.$WAN_RULE.enabled=1"
+    # Validate the generated firewall before committing or reloading it.
+    fw4 check >/dev/null || die "fw4 validation failed; firewall not reloaded"
+    uci commit zerotier
+    uci commit firewall
+    /etc/init.d/firewall reload || die "firewall reload failed; inspect firewall state"
+    info "ZeroTier input/forward allowed, masquerading disabled; WAN UDP 9993 allowed"
+}
 cron_add() {
     touch "$CRON"
     sed -i '\|# zerotier-site-route managed$|d' "$CRON"
@@ -119,15 +167,6 @@ cron_remove() {
     sed -i '\|/usr/sbin/zerotier-site-route|d' "$CRON"
     /etc/init.d/cron reload
 }
-nat_disable() {
-    # Change only this network's ZeroTier NAT setting.
-    section=$(zt_section)
-    [ -n "$section" ] || die "ZeroTier UCI network section not found"
-    uci -q delete "zerotier.$section.fw_allow_masq" || true
-    uci commit zerotier
-    info "ZeroTier NAT disabled in UCI; runtime firewall rules are not modified"
-}
-
 case "$ACTION" in
     install)
         require_root
@@ -149,7 +188,7 @@ case "$ACTION" in
         printf 'ROLE=%s\n' "$ROLE" > "${CONFIG}.tmp"
         chmod 0644 "${CONFIG}.tmp"
         mv -f "${CONFIG}.tmp" "$CONFIG"
-        nat_disable
+        firewall_setup
         apply
         # Remove only the known legacy cron entry; leave the legacy script for manual review.
         [ -f "$CRON" ] && sed -i '\|^\* \* \* \* \* /usr/sbin/zerotier-lan-routes$|d' "$CRON"
@@ -173,8 +212,13 @@ case "$ACTION" in
             fi
         done
         cron_remove
+        if [ "$(uci -q get "firewall.$WAN_RULE.name" 2>/dev/null || true)" = ZeroTier-Site-UDP-9993 ]; then
+            uci -q delete "firewall.$WAN_RULE"
+            uci commit firewall
+            /etc/init.d/firewall reload || die "firewall reload failed after removing managed UDP rule"
+        fi
         rm -f "$CONFIG" "$SELF"
-        info "Removed managed routes and cron; ZeroTier NAT configuration is left unchanged"
+        info "Removed managed routes and cron; ZeroTier input/forward/NAT UCI settings are left unchanged"
         ;;
     *) echo "Usage: $0 install r3s|r4s | reconcile | check | uninstall" >&2; exit 2 ;;
 esac
