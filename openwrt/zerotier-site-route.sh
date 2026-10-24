@@ -7,7 +7,6 @@ NETWORK_ID=233ccaac273aa22d
 CONFIG=/etc/zerotier-site-route.conf
 SELF=/usr/sbin/zerotier-site-route
 CRON=/etc/crontabs/root
-OLD=/usr/sbin/zerotier-lan-routes
 TAG='# zerotier-site-route managed'
 ACTION=${1:-}
 ROLE=${2:-}
@@ -17,8 +16,8 @@ info() { echo "$*"; }
 require_root() { [ "$(id -u)" -eq 0 ] || die "run as root"; }
 role_values() {
     case "$ROLE" in
-        r3s) LAN=192.168.13.0/24; PEER_LAN=192.168.10; PEER_ZT=192.168.192.10 ;;
-        r4s) LAN=192.168.10.0/24; PEER_LAN=192.168.13; PEER_ZT=192.168.192.13 ;;
+        r3s) LAN=192.168.13.1/24; PEER_LAN=192.168.10; PEER_ZT=192.168.192.10 ;;
+        r4s) LAN=192.168.10.1/24; PEER_LAN=192.168.13; PEER_ZT=192.168.192.13 ;;
         *) die "role must be r3s or r4s" ;;
     esac
     FIRST="${PEER_LAN}.0/25"
@@ -31,7 +30,28 @@ load_role() {
 }
 device() {
     zerotier-cli listnetworks 2>/dev/null |
-        awk -v id="$NETWORK_ID" '$1=="200" && $2=="listnetworks" && $3==id && $6=="OK" {print $8; exit}'
+        awk -v id="$NETWORK_ID" '
+          $1=="200" && $2=="listnetworks" && $3==id {
+            for (i=4; i<=NF-2; i++)
+              if ($i=="OK" && $(i+1) ~ /^(PRIVATE|PUBLIC)$/ &&
+                  $(i+2) ~ /^[[:alnum:]_.-]+$/) {
+                print $(i+2); exit
+              }
+          }'
+}
+zt_section() {
+    uci -q show zerotier 2>/dev/null | awk -v id="$NETWORK_ID" '
+      /^zerotier\.[^.]+\.id=/ {
+        split($0,a,"="); v=a[2]; gsub(/\047|\042/,"",v)
+        if (v==id) {
+          k=a[1]; sub(/^zerotier\./,"",k); sub(/\.id$/,"",k)
+          print k; exit
+        }
+      }'
+}
+validate_role() {
+    ip -4 -o addr show | awk -v ip="$LAN" '$4==ip {ok=1} END {exit !ok}' ||
+        die "wrong router role or LAN IP; expected $LAN"
 }
 validate() {
     command -v zerotier-cli >/dev/null || die "zerotier-cli missing"
@@ -57,6 +77,7 @@ apply() {
     done
 }
 check() {
+    validate_role
     validate
     for subnet in "$FIRST" "$SECOND"; do
         desired "$subnet" || die "route missing: $subnet"
@@ -65,18 +86,30 @@ check() {
         ip -4 route get "$addr" | grep -q "dev $ZT_DEV" ||
             die "route selection incorrect: $addr"
     done
-    if uci -q get zerotier.Choicky_Zerotier.fw_allow_masq | grep -q '^1$'; then
+    nat_check
+    info "PASS: $ROLE via $ZT_DEV; two /25 routes selected; ZeroTier NAT not detected"
+}
+nat_check() {
+    section=$(zt_section)
+    [ -n "$section" ] || die "ZeroTier UCI section missing"
+    [ "$(uci -q get "zerotier.$section.fw_allow_masq" 2>/dev/null || true)" != 1 ] ||
         die "ZeroTier NAT enabled in UCI"
-    fi
-    if nft list chain inet fw4 srcnat 2>/dev/null |
-        grep -E 'oifname.*masquerade.*ZeroTier' >/dev/null; then
+    command -v nft >/dev/null || die "nft missing"
+    rules=$(nft list chain inet fw4 srcnat 2>&1) ||
+        die "cannot inspect active NAT: $rules"
+    if printf '%s\n' "$rules" |
+        grep -E 'masquerade.*ZeroTier|ZeroTier.*masquerade' >/dev/null; then
         die "ZeroTier NAT still active"
     fi
-    info "PASS: $ROLE via $ZT_DEV; two /25 routes selected; ZeroTier NAT not detected"
+    [ -f /var/run/zerotier-one/_fw4/srcnat.nft ] ||
+        die "ZeroTier NAT include missing"
+    if grep -q masquerade /var/run/zerotier-one/_fw4/srcnat.nft; then
+        die "ZeroTier generated NAT rule remains"
+    fi
 }
 cron_add() {
     touch "$CRON"
-    sed -i '\|/usr/sbin/zerotier-site-route|d' "$CRON"
+    sed -i '\|# zerotier-site-route managed$|d' "$CRON"
     printf '* * * * * %s reconcile >/dev/null 2>&1 %s\n' "$SELF" "$TAG" >> "$CRON"
     /etc/init.d/cron enable
     /etc/init.d/cron reload
@@ -88,7 +121,7 @@ cron_remove() {
 }
 nat_disable() {
     # Change only this network's ZeroTier NAT setting.
-    section=$(uci -q show zerotier | awk -F '[.=]' -v id="$NETWORK_ID" '$3=="id" && $0 ~ id {print $2; exit}')
+    section=$(zt_section)
     [ -n "$section" ] || die "ZeroTier UCI network section not found"
     uci -q delete "zerotier.$section.fw_allow_masq" || true
     uci commit zerotier
@@ -102,14 +135,16 @@ sync_nat() {
     command -v zerotier-fw4 >/dev/null || die "zerotier-fw4 missing"
     [ -f /var/run/zerotier-one/_fw4/srcnat.nft ] ||
         die "ZeroTier srcnat include missing"
+    section=$(zt_section)
+    [ -n "$section" ] || die "ZeroTier UCI section missing"
+    [ "$(uci -q get "zerotier.$section.fw_allow_masq" 2>/dev/null || true)" != 1 ] ||
+        die "ZeroTier NAT still enabled in UCI"
     zerotier-fw4 -s || die "zerotier-fw4 regeneration failed"
     if grep -q masquerade /var/run/zerotier-one/_fw4/srcnat.nft; then
         die "generated NAT remains; refusing firewall reload"
     fi
     /etc/init.d/firewall reload || die "firewall reload failed"
-    if nft list chain inet fw4 srcnat 2>/dev/null | grep -E 'oifname.*masquerade.*ZeroTier' >/dev/null; then
-        die "ZeroTier NAT still active after reload"
-    fi
+    nat_check
     info "PASS: ZeroTier NAT absent after regeneration"
 }
 case "$ACTION" in
@@ -119,19 +154,24 @@ case "$ACTION" in
         [ -f "$0" ] || die "run from a saved script file"
         [ -d /etc/crontabs ] || die "cron not installed"
         validate
-        [ "$(ip -4 route show dev br-lan | grep -c "$LAN" || true)" -ge 1 ] ||
-            info "WARNING: expected LAN $LAN not confirmed on br-lan"
+        validate_role
+        [ -n "$(zt_section)" ] || die "ZeroTier UCI section missing"
         if [ -f "$CONFIG" ]; then
             previous=$(sed -n 's/^ROLE=//p' "$CONFIG" | head -n 1)
             [ "$previous" = "$ROLE" ] || die "already installed for $previous; uninstall first"
         fi
-        install -m 0755 "$0" "$SELF"
-        printf 'ROLE=%s\n' "$ROLE" > "$CONFIG"
-        chmod 0644 "$CONFIG"
+        if [ "$0" != "$SELF" ]; then
+            cp "$0" "${SELF}.tmp" || die "script copy failed"
+            chmod 0755 "${SELF}.tmp"
+            mv -f "${SELF}.tmp" "$SELF"
+        fi
+        printf 'ROLE=%s\n' "$ROLE" > "${CONFIG}.tmp"
+        chmod 0644 "${CONFIG}.tmp"
+        mv -f "${CONFIG}.tmp" "$CONFIG"
         nat_disable
         apply
         # Remove only the known legacy cron entry; leave the legacy script for manual review.
-        [ -f "$CRON" ] && sed -i '\|/usr/sbin/zerotier-lan-routes|d' "$CRON"
+        [ -f "$CRON" ] && sed -i '\|^\* \* \* \* \* /usr/sbin/zerotier-lan-routes$|d' "$CRON"
         cron_add
         info "Installed for $ROLE. Check with: $SELF check"
         ;;
@@ -145,15 +185,14 @@ case "$ACTION" in
     uninstall)
         require_root
         load_role
+        for subnet in "$FIRST" "$SECOND"; do
+            if ip -4 route show "$subnet" | grep -F "via $PEER_ZT " |
+                grep -q 'metric 100'; then
+                ip -4 route del "$subnet" via "$PEER_ZT" metric 100 ||
+                    die "cannot remove $subnet; keeping installation for retry"
+            fi
+        done
         cron_remove
-        if command -v zerotier-cli >/dev/null && [ -n "$(device)" ]; then
-            ZT_DEV=$(device)
-            for subnet in "$FIRST" "$SECOND"; do
-                if desired "$subnet"; then
-                    ip -4 route del "$subnet" via "$PEER_ZT" dev "$ZT_DEV" metric 100 || true
-                fi
-            done
-        fi
         rm -f "$CONFIG" "$SELF"
         info "Removed managed routes and cron; ZeroTier NAT configuration is left unchanged"
         ;;
