@@ -132,21 +132,66 @@ nat_disable() {
     fi
 }
 sync_nat() {
-    command -v zerotier-fw4 >/dev/null || die "zerotier-fw4 missing"
-    [ -f /var/run/zerotier-one/_fw4/srcnat.nft ] ||
-        die "ZeroTier srcnat include missing"
+    # zerotier-fw4 -s only generates service rules; it does NOT rebuild srcnat.nft.
+    # Remove only masquerade lines bound to this network's actual ZeroTier device.
+    validate_role
+    validate
     section=$(zt_section)
     [ -n "$section" ] || die "ZeroTier UCI section missing"
     [ "$(uci -q get "zerotier.$section.fw_allow_masq" 2>/dev/null || true)" != 1 ] ||
         die "ZeroTier NAT still enabled in UCI"
-    zerotier-fw4 -s || die "zerotier-fw4 regeneration failed"
-    if grep -q masquerade /var/run/zerotier-one/_fw4/srcnat.nft; then
-        die "generated NAT remains; refusing firewall reload"
+    command -v nft >/dev/null || die "nft missing"
+
+    include=/var/run/zerotier-one/_fw4/srcnat.nft
+    [ -f "$include" ] || die "ZeroTier srcnat include missing"
+    backup="${include}.site-route-backup"
+    candidate="${include}.site-route-new"
+    [ ! -e "$backup" ] && [ ! -e "$candidate" ] ||
+        die "stale NAT backup/temp file; inspect before retrying"
+
+    # Fail closed if any masquerade line cannot be safely attributed to a device.
+    # Typical generated rule: oifname "zt..." masquerade comment "ZeroTier ..."
+    awk -v dev="$ZT_DEV" '
+        /masquerade/ {
+            if (index($0, "oifname") == 0) exit 2
+            if (index($0, dev) != 0) next
+            if (index($0, "ZeroTier") != 0) exit 3
+        }
+        { print }
+    ' "$include" > "$candidate" || {
+        rm -f "$candidate"
+        die "ambiguous generated NAT rule; include unchanged"
+    }
+
+    # Never silently remove another network's NAT.
+    if grep -F "$ZT_DEV" "$candidate" | grep -q masquerade; then
+        rm -f "$candidate"
+        die "target ZeroTier masquerade remains"
     fi
-    /etc/init.d/firewall reload || die "firewall reload failed"
-    nat_check
-    info "PASS: ZeroTier NAT absent after regeneration"
+    cp -p "$include" "$backup" || {
+        rm -f "$candidate"
+        die "cannot back up ZeroTier NAT include"
+    }
+    chmod 0644 "$candidate"
+    mv -f "$candidate" "$include" || {
+        cp "$backup" "$include" || true
+        die "cannot install filtered ZeroTier NAT include"
+    }
+
+    if ! /etc/init.d/firewall reload; then
+        cp "$backup" "$include" || true
+        /etc/init.d/firewall reload || true
+        die "firewall reload failed; attempted rollback"
+    fi
+    if ! nat_check; then
+        cp "$backup" "$include" || true
+        /etc/init.d/firewall reload || true
+        die "NAT verification failed; attempted rollback"
+    fi
+    rm -f "$backup"
+    info "PASS: target ZeroTier NAT absent in UCI, include and active firewall"
 }
+
 case "$ACTION" in
     install)
         require_root
