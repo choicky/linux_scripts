@@ -24,6 +24,7 @@ one place and cannot drift apart.
 - `caddy/migrate-caddy-deployment.sh` — one-time, evidence-based migration from a legacy/manual Caddy or sing-box layout to the standard one. It absorbs the former sing-box certificate-path/startup migration, verifies that every effective certificate/key reference is actually readable by `www-data` before any identity change or activation, and removes a shadowing local sing-box unit, then delegates reconciliation to the normalizer.
 - `caddy/normalize-caddy-services.sh` — the shared, repeatable runtime reconciler (modes `--caddy`, `--sing-box`, `--both`). It owns the managed drop-ins and permissions, runs both services as `www-data:www-data` so sing-box reads Caddy certificates directly, reconciles (restarts only when a unit change must reach a running service) an already-compliant layout without changes, and on a failed restart rolls the applied changes back and recovers the previously running services.
 - `sing-box/install-sing-box-debian.sh` — install the official Stable `sing-box` APT package (not `sing-box-beta`) and run it as `www-data:www-data`.
+- `openwrt/zerotier-site-route.sh` — shared R3S/R4S ZeroTier site-to-site route installer; uses two more-specific /25 routes per peer LAN to override a competing Tailscale /24, without modifying Tailscale or sing-box. Requires an existing authorized ZeroTier network. See usage below.
 - `openwrt/R4S-momo-to-native-sing-box.md` — R4S/ImmortalWrt migration record from OpenWrt-Momo core_only to native sing-box under procd, including Tailscale state, verification and rollback (separate from Debian scripts).
 - `system/init-debian-server.sh` — two-phase baseline initialization for fresh Debian 12/13 VPS instances; creates/verifies a sudo administrator, optional swap, fail2ban, and SSH hardening while deliberately retaining password authentication.
 - `shell/setup-root-colors.sh` — optional root shell colour setup.
@@ -748,3 +749,23 @@ first Ubuntu Caddy deployment. Acceptance criteria: run
 the managed `www-data` layout, `/usr/bin/caddy` resolves to `caddy.custom`, and
 a second run is a normalizing no-op. Mocked tests prove control flow and
 refusals; they do not prove APT resolution or live systemd behaviour on Ubuntu.
+
+## OpenWrt ZeroTier R3S/R4S site routes
+
+Both routers use `openwrt/zerotier-site-route.sh`, with only the role different. ZeroTier network `233ccaac273aa22d` must already be joined and authorized in Central. R3S has LAN `192.168.13.0/24`, gateway `192.168.13.1`, and ZeroTier IP `192.168.192.13`; R4S has LAN `192.168.10.0/24`, gateway `192.168.10.1`, and ZeroTier IP `192.168.192.10`. The installer validates the local LAN address and discovers the ZeroTier device dynamically. It does not install, restart, or rejoin ZeroTier, nor modify Tailscale or sing-box.
+
+Download the script to a local file, inspect it, and run on the appropriate router:
+
+```sh
+sh zerotier-site-route.sh install r3s  # R3S only
+sh zerotier-site-route.sh install r4s  # R4S only
+/usr/sbin/zerotier-site-route check
+```
+
+Installation configures two more-specific /25 routes to the other LAN (to take precedence over an overlapping Tailscale /24 route), creates one root cron entry to reconcile those routes every minute, and removes the exact legacy R3S cron entry for `/usr/sbin/zerotier-lan-routes` without deleting the legacy file. The cron job only repairs routes, not firewall rules.
+
+For the already-installed ImmortalWrt `zerotier-fw4` integration, installation sets `fw_allow_input=1`, `fw_allow_forward=1`, and removes `fw_allow_masq` for the matching ZeroTier network. It also creates or reconciles a named IPv4 WAN input firewall rule, `zerotier_site_udp_9993` (`ZeroTier-Site-UDP-9993`), accepting UDP destination port 9993. This is **not** a port-forward/DNAT rule; no UPnP or blanket UDP allowance is added. The installer validates with `fw4 check` before committing, reloads the firewall, invokes `zerotier-fw4 -i` for the discovered interface, and verifies both generated and live inbound/outbound forwarding rules; it never restarts ZeroTier. The upstream generator may skip forwarding generation when an input rule already exists; in that case installation fails rather than falsely reporting success, and the incomplete generated state requires manual inspection. If another rule occupies the managed section name, installation refuses to overwrite it. A firewall reload is not equivalent to regeneration of every stale ZeroTier-generated nft include: `check` still fails if old masquerade rules remain and they must be addressed separately.
+
+`check` validates the routes, ZeroTier NAT state, managed firewall UCI settings, and the generated and live ZeroTier forwarding rules; it does **not** prove end-to-end client reachability. Verify actual LAN clients in both directions, UDP reachability, and recovery after a reboot. The script does not configure ZeroTier Central Managed Routes or external upstream NAT/port mapping. Official ZeroTier guidance says manual port forwarding is normally unnecessary and unrestricted outbound UDP is preferable for peer-to-peer connectivity.
+
+`uninstall` removes the managed routes, cron entry, script/config files, and the named UDP 9993 firewall rule if it still has the expected name. It leaves ZeroTier's input/forward/masquerade UCI settings as configured and does not uninstall ZeroTier. The router's firewall configuration must have a `wan` zone and working fw4 service; this tool is specific to the two named routers, not a generic ZeroTier provisioning system.
