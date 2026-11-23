@@ -533,11 +533,9 @@ normalize_permissions(){
   install -d -o www-data -g www-data -m 0755 /var/lib/sing-box
   normalize_tree /var/lib/sing-box www-data:www-data
 
-  # /var/log/sing-box/ is normalized only when it already exists.
-  if [[ -e /var/log/sing-box ]]; then
-    install -d -o www-data -g www-data -m 0755 /var/log/sing-box
-    normalize_tree /var/log/sing-box www-data:www-data
-  fi
+  # Create the log directory before startup for configs with file logging.
+  install -d -o www-data -g www-data -m 0755 /var/log/sing-box
+  normalize_tree /var/log/sing-box www-data:www-data
 
   # Systemd drop-in files -- root:root, directory 0755, files 0644.
   install -d -o root -g root -m 0755 "$DROPIN_DIR"
